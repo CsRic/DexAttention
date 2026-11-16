@@ -1,0 +1,17 @@
+Changes applied to DCP's flash-attention fork (https://github.com/chenyu-jiang/flash-attention, branch dcp) @ a15bcc7 for the evaluation:
+- setup.py: the sm_90 target is built only when DCP_FA_SM90=1 (sm_86 GPUs run the sm_80 binary).
+
+diff --git a/setup.py b/setup.py
+index b385410..15d177d 100644
+--- a/setup.py
++++ b/setup.py
+@@ -170,7 +170,8 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
+     cc_flag.append("-gencode")
+     cc_flag.append("arch=compute_80,code=sm_80")
+     if CUDA_HOME is not None:
+-        if bare_metal_version >= Version("11.8"):
++        # sm_86 GPUs run the sm_80 binary; the sm_90 target is built only with DCP_FA_SM90=1
++        if bare_metal_version >= Version("11.8") and os.environ.get("DCP_FA_SM90") == "1":
+             cc_flag.append("-gencode")
+             cc_flag.append("arch=compute_90,code=sm_90")
+ 

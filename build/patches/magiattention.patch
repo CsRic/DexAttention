@@ -1,0 +1,107 @@
+Changes applied to MagiAttention (https://github.com/SandAI-org/MagiAttention) @ a3276e7b for the evaluation:
+- functional/dist_attn.py, dist_attn_runtime_mgr.py: MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE=1 is honoured
+  with the FA4 kernel backend (partial dQ / dK / dV widened to fp32 before the group reduce; fp32 buffers).
+- utils/dtype.py: no fp4 dtype on PyTorch 2.5.
+Install the patched tree (pip install --no-build-isolation .) so the imported copy is the patched one.
+
+diff --git a/magi_attention/dist_attn_runtime_mgr.py b/magi_attention/dist_attn_runtime_mgr.py
+index b56c5bd..16e652f 100644
+--- a/magi_attention/dist_attn_runtime_mgr.py
++++ b/magi_attention/dist_attn_runtime_mgr.py
+@@ -475,8 +475,9 @@ def check_flag_comb() -> None:
+ 
+         assert (  # TODO
+             not env.comm.is_fwd_high_precision_reduce_enable()
+-            and not env.comm.is_bwd_high_precision_reduce_enable()
+-        ), "FA4 backend is not compatible with high-precision reduce for now"
++            # backward high-precision reduce is implemented for FA4 in functional/dist_attn.py (FA4's per-call
++            # partial dq / dk / dv widened to fp32), so only the forward is refused
++        ), "FA4 backend is not compatible with forward high-precision reduce for now"
+ 
+         assert (  # TODO
+             not env.comm.is_qo_comm_enable()
+diff --git a/magi_attention/functional/dist_attn.py b/magi_attention/functional/dist_attn.py
+index 48e9c7b..154a2ba 100644
+--- a/magi_attention/functional/dist_attn.py
++++ b/magi_attention/functional/dist_attn.py
+@@ -1428,6 +1428,13 @@ class DistAttnRuntime:
+                     sink_layout="sh",
+                     deterministic=self.deterministic,
+                 )
++                if self.bwd_hp_reduce:
++                    # MAGI_ATTENTION_BACKWARD_HIGH_PRECISION_REDUCE=1 with the FA4 backend: FA4 only emits fp16 / bf16,
++                    # so its per-call partial dq / dk / dv are widened to fp32 here; the buffers, the group-reduce
++                    # communication and the accumulation then run in fp32 as Magi's high-precision reduce does for FFA
++                    partial_dq, partial_dk, partial_dv = (
++                        x.to(self.hp_dtype) for x in (partial_dq, partial_dk, partial_dv)
++                    )
+                 partial_dkv = self._maybe_concat(
+                     partial_dk, partial_dv, need_concat=self.concat_dkv
+                 )
+@@ -2239,7 +2246,7 @@ class DistAttnRuntime:
+                     # dkv always in high-precision if using native grpcoll
+                     # unless using fa4 backend which only supports fp16/bf16 for now
+                     need_hp_dtype=(
+-                        self.kernel_backend != MagiAttentionKernelBackend.FA4
++                        (self.kernel_backend != MagiAttentionKernelBackend.FA4 or self.bwd_hp_reduce)
+                     )
+                     and (self.use_native_grpcoll or self.bwd_hp_reduce),
+                 ),
+@@ -2379,7 +2386,7 @@ class DistAttnRuntime:
+                         # dq always in high-precision if using native grpcoll
+                         # unless using fa4 backend which only supports fp16/bf16 for now
+                         need_hp_dtype=(
+-                            self.kernel_backend != MagiAttentionKernelBackend.FA4
++                            (self.kernel_backend != MagiAttentionKernelBackend.FA4 or self.bwd_hp_reduce)
+                         )
+                         and (self.use_native_grpcoll or self.bwd_hp_reduce),
+                     ),
+@@ -2587,7 +2594,7 @@ class DistAttnRuntime:
+             dtype=self._maybe_hp_dtype(
+                 q.dtype,
+                 # FA4 bwd only emits fp16/bf16; keep buffer dtype in sync
+-                need_hp_dtype=(self.kernel_backend != MagiAttentionKernelBackend.FA4)
++                need_hp_dtype=((self.kernel_backend != MagiAttentionKernelBackend.FA4 or self.bwd_hp_reduce))
+                 and not self.bwd_local_dq_lp_init,
+             ),
+         )
+@@ -2596,7 +2603,7 @@ class DistAttnRuntime:
+             dtype=self._maybe_hp_dtype(
+                 k.dtype,
+                 # FA4 bwd only emits fp16/bf16; keep buffer dtype in sync
+-                need_hp_dtype=(self.kernel_backend != MagiAttentionKernelBackend.FA4)
++                need_hp_dtype=((self.kernel_backend != MagiAttentionKernelBackend.FA4 or self.bwd_hp_reduce))
+                 and not self.bwd_local_dkv_lp_init,
+             ),
+             device=k.device,
+@@ -2632,7 +2639,7 @@ class DistAttnRuntime:
+             dtype=self._maybe_hp_dtype(
+                 q.dtype,
+                 # FA4 bwd only emits fp16/bf16; keep buffer dtype in sync
+-                need_hp_dtype=(self.kernel_backend != MagiAttentionKernelBackend.FA4)
++                need_hp_dtype=((self.kernel_backend != MagiAttentionKernelBackend.FA4 or self.bwd_hp_reduce))
+                 and not self.bwd_local_dq_lp_init,
+             ),
+         )
+@@ -2654,7 +2661,7 @@ class DistAttnRuntime:
+             dtype=self._maybe_hp_dtype(
+                 k.dtype,
+                 # FA4 bwd only emits fp16/bf16; keep buffer dtype in sync
+-                need_hp_dtype=(self.kernel_backend != MagiAttentionKernelBackend.FA4)
++                need_hp_dtype=((self.kernel_backend != MagiAttentionKernelBackend.FA4 or self.bwd_hp_reduce))
+                 and not self.bwd_local_dkv_lp_init,
+             ),
+             device=k.device,
+diff --git a/magi_attention/utils/dtype.py b/magi_attention/utils/dtype.py
+index 576e3ad..79b1054 100644
+--- a/magi_attention/utils/dtype.py
++++ b/magi_attention/utils/dtype.py
+@@ -20,7 +20,7 @@ __version__ = "1.0.0"
+ def fp_dtype_bits(
+     dtype: torch.dtype,
+ ) -> int:
+-    if dtype == torch.float4_e2m1fn_x2:
++    if dtype == getattr(torch, "float4_e2m1fn_x2", None):  # torch 2.5 has no fp4 dtype
+         # NOTE: _x2 suffix for packed representation
+         # of two float4_e2m1f values into one byte
+         # see issue: https://github.com/pytorch/pytorch/issues/146414

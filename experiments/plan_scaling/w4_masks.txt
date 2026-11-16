@@ -1,0 +1,8 @@
+# The 5 W4 masks of the top-k / top-p series, one '<sequence>:<layer>' per line. The order is the one the seeded packing
+# permutes. Each sequence is a W4 sequence (cases144.txt); 66ec1054821e116aacb19f1a_131072:31 is not an operator-test case
+# because those use layers 0 / 8 / 16 / 24, but workloads/w4_infllm/prepare.sh records the selection of every layer.
+66ebd34d5a08c7b9b35e035d_65536:16
+66ec1054821e116aacb19f1a_131072:8
+66ec1054821e116aacb19f1a_131072:16
+66ec1054821e116aacb19f1a_131072:31
+66f2e874821e116aacb2c0af_131072:16

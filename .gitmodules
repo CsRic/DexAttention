@@ -1,0 +1,37 @@
+[submodule "third_party/flash-attention"]
+	path = third_party/flash-attention
+	url = https://github.com/Dao-AILab/flash-attention.git
+	ignore = dirty
+[submodule "third_party/infllmv2_cuda_impl"]
+	path = third_party/infllmv2_cuda_impl
+	url = https://github.com/OpenBMB/infllmv2_cuda_impl.git
+	ignore = dirty
+[submodule "third_party/yunchang"]
+	path = third_party/yunchang
+	url = https://github.com/feifeibear/long-context-attention.git
+	ignore = dirty
+[submodule "third_party/ultraattn"]
+	path = third_party/ultraattn
+	url = https://github.com/oliverYoung2001/UltraAttn.git
+	ignore = dirty
+[submodule "third_party/dcp"]
+	path = third_party/dcp
+	url = https://github.com/chenyu-jiang/dcp.git
+	ignore = dirty
+[submodule "third_party/dcp_flash_attention"]
+	path = third_party/dcp_flash_attention
+	url = https://github.com/chenyu-jiang/flash-attention.git
+	branch = dcp
+	ignore = dirty
+[submodule "third_party/magiattention"]
+	path = third_party/magiattention
+	url = https://github.com/SandAI-org/MagiAttention.git
+	ignore = dirty
+[submodule "third_party/flex_prefill"]
+	path = third_party/flex_prefill
+	url = https://github.com/bytedance/FlexPrefill.git
+	ignore = dirty
+[submodule "third_party/SpargeAttn"]
+	path = third_party/SpargeAttn
+	url = https://github.com/thu-ml/SpargeAttn.git
+	ignore = dirty

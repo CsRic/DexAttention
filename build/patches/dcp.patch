@@ -1,0 +1,507 @@
+Changes applied to DCP (https://github.com/chenyu-jiang/dcp) @ e1e19b8 for the evaluation:
+- DCP_FP32_OUT=1: forward partial outputs and backward partial dQ / dK / dV stored, sent and reduced in fp32 (the
+  kernels write fp16 scratch rows that are widened); the planner prices those blocks at 4 bytes per element.
+- Communication / compute cost model of the target cluster from the environment: DCP_INTER_GBPS, DCP_INTRA_GBPS,
+  DCP_INTER_LAT_MS, DCP_INTRA_LAT_MS, DCP_PEAK_TFLOPS, DCP_PEAK_MEMBW (unset: upstream defaults).
+- DCP_SMALL_SMEM=1 (default): the 32-token reduction tile for GPUs with ~100 KB shared memory per block.
+- Microbenchmark: mask type 'ranges_file' (two key ranges per token from DCP_RANGES_FILE), per-rank plan cache
+  (DCP_PLAN_CACHE), latency mode (DCP_BENCH_LATENCY=1: barrier before every call, slowest rank, median of 10).
+
+diff --git a/benchmark/microbenchmark/benchmark_attention.py b/benchmark/microbenchmark/benchmark_attention.py
+index 5e11699..2cc6bc0 100644
+--- a/benchmark/microbenchmark/benchmark_attention.py
++++ b/benchmark/microbenchmark/benchmark_attention.py
+@@ -2,6 +2,7 @@ import argparse
+ import datetime
+ import json
+ import os
++import time
+ from typing import List
+ import random
+ 
+@@ -35,6 +36,7 @@ from dcp.runtime.flash_attention.interface import (
+ from dcp.runtime.flash_attention.utils import (
+     reconstruct_attention_forward_output_for_test,
+     lambda_mask_fn,
++    ranges_file_mask_fn,
+     shared_question_mask_fn,
+     causal_blockwise_mask_fn,
+ )
+@@ -45,6 +47,8 @@ def get_mask_fn(mask_type: str):
+         return None
+     elif mask_type == "lambda":
+         return lambda_mask_fn
++    elif mask_type == "ranges_file":
++        return ranges_file_mask_fn
+     elif mask_type == "shared_question":
+         return shared_question_mask_fn
+     elif mask_type == "causal_blockwise":
+@@ -90,7 +94,7 @@ def parse_args():
+         "--mask",
+         type=str,
+         default="causal",
+-        choices=["causal", "lambda", "shared_question", "causal_blockwise"],
++        choices=["causal", "lambda", "ranges_file", "shared_question", "causal_blockwise"],
+     )
+     parser.add_argument(
+         "--seqlens-config",
+@@ -325,7 +329,18 @@ def generate_input(args, batch_seqlens: List[List[int]]):
+                 )
+             )
+             flattened_seqlens.extend(seqlens)
+-        dataloader = get_dataloader_for_benchmark(
++        # DCP_PLAN_CACHE=<prefix>: plan once per (input, configuration), reuse it in later
++        # launches (each rank caches its own execution plans; planning cost is reported separately)
++        _cache = os.environ.get("DCP_PLAN_CACHE", "")
++        _cfile = f"{_cache}.cp{args.cp_rank}.pkl" if _cache else ""
++        if _cfile and os.path.exists(_cfile):
++            import pickle as _pk
++            _items = _pk.load(open(_cfile, "rb"))
++            print(f"[dcp plan cache] loaded {_cfile}", flush=True)
++            dataloader = [(None, *x, None) for x in _items]
++        else:
++          _t_plan0 = time.time()
++          dataloader = get_dataloader_for_benchmark(
+             flattened_seqlens,
+             batch_indices,
+             args.mask,
+@@ -342,7 +357,13 @@ def generate_input(args, batch_seqlens: List[List[int]]):
+             args.num_preprocessing_workers,
+             args.use_block_size_heuristic,
+             mask_fn=get_mask_fn(args.mask),
+-        )
++          )
++          if _cfile:
++            import pickle as _pk
++            _items = [(x[1], x[2], x[3], x[4]) for x in dataloader]
++            _pk.dump(_items, open(_cfile + ".tmp", "wb")); os.replace(_cfile + ".tmp", _cfile)
++            print(f"[dcp plan cache] planned in {time.time() - _t_plan0:.1f} s -> {_cfile}", flush=True)
++            dataloader = [(None, *x, None) for x in _items]
+         for batch_idx, (
+             _,
+             fw_exec_plan,
+@@ -695,6 +716,8 @@ def prepare_and_gen_args(args, inputs_per_batch):
+                 dist.get_world_size(),
+                 n_nodes,
+             )
++            if dist.get_rank() == 0:                       # the profile actually used
++                print(f"[dcp profile] comm {exec_context.comm_cost_model!r} comp {exec_context.comp_cost_model!r}", flush=True)
+             executor = get_executor(
+                 args.head_block_size, args.head_dim, exec_context
+             )
+diff --git a/benchmark/microbenchmark/utils.py b/benchmark/microbenchmark/utils.py
+index dec74f8..8a65ac9 100644
+--- a/benchmark/microbenchmark/utils.py
++++ b/benchmark/microbenchmark/utils.py
+@@ -141,6 +141,9 @@ def get_lse_diff(flash_attn_lse, cp_attn_lse, cu_seqlens, cp_type, cp_group):
+     return lse_diff_mean, lse_diff_max
+ 
+ 
++LAST = {}   # the last benchmark_f latency (DCP_BENCH_LATENCY=1)
++
++
+ def benchmark_f(
+     f,
+     warmup,
+@@ -222,4 +225,23 @@ def benchmark_f(
+     all_device_times = torch.cat(all_device_times)
+     avg_time = all_device_times.mean().item()
+     max_time = all_device_times.max().item()
++    if os.environ.get("DCP_BENCH_LATENCY") == "1":
++        # latency mode: global barrier before every call, slowest rank's
++        # barrier->done wall time, median of 10
++        import time as _time
++        lats = []
++        for _ in range(10):
++            dist.barrier(device_ids=[torch.cuda.current_device()])
++            torch.cuda.synchronize()
++            t0 = _time.perf_counter()
++            run_fn()
++            torch.cuda.synchronize()
++            x = torch.tensor([_time.perf_counter() - t0], dtype=torch.float32)
++            dist.all_reduce(x, op=dist.ReduceOp.MAX)
++            lats.append(x.item())
++        lats.sort()
++        LAST["latency_ms"] = (lats[4] + lats[5]) / 2 * 1e3; LAST["events_max_ms"] = max_time   # for the track driver
++        if dist.get_rank() == 0:
++            print("LATENCY_MEDIAN_MS {:.4f} EVENTS_MAX_MS {:.4f}".format(
++                (lats[4] + lats[5]) / 2 * 1e3, max_time), flush=True)
+     return avg_time, max_time
+diff --git a/dcp/core/common.py b/dcp/core/common.py
+index bc2c8e5..3986d31 100644
+--- a/dcp/core/common.py
++++ b/dcp/core/common.py
+@@ -50,10 +50,20 @@ class ExecutionContext:
+ def get_default_execution_context(
+     n_devices: int, n_nodes: int
+ ) -> ExecutionContext:
++    # the communication profile of the target cluster (the defaults -- 400 / 4800 Gbps, 0 ms -- are
++    # an H100 + 400G IB testbed): DCP_INTER_GBPS / DCP_INTRA_GBPS (Gbps, DCP's unit) and DCP_INTER_LAT_MS /
++    # DCP_INTRA_LAT_MS (ms); unset = upstream defaults
++    import os
++    comm = CommunicationCostModel(
++        inter_node_latency=float(os.environ.get("DCP_INTER_LAT_MS", 0)),
++        inter_node_bandwidth=float(os.environ.get("DCP_INTER_GBPS", 400)),
++        intra_node_latency=float(os.environ.get("DCP_INTRA_LAT_MS", 0)),
++        intra_node_bandwidth=float(os.environ.get("DCP_INTRA_GBPS", 4800)),
++    )
+     return ExecutionContext(
+         n_devices // n_nodes,
+         n_nodes,
+-        CommunicationCostModel(),
++        comm,
+         AttnRooflineCostModel(),
+     )
+ 
+diff --git a/dcp/core/cost_model.py b/dcp/core/cost_model.py
+index 0f0d313..50374ab 100644
+--- a/dcp/core/cost_model.py
++++ b/dcp/core/cost_model.py
+@@ -90,9 +90,11 @@ class AttnRooflineCostModel(CostModel):
+         Args:
+             max_tflops: peak TFLOPS/s for a GPU
+             max_mem_bw: Maximum memory bandwidth in GB/s
++        DCP_PEAK_TFLOPS / DCP_PEAK_MEMBW override the defaults (H100-class) for other GPUs.
+         """
+-        self.max_tflops = max_tflops
+-        self.max_mem_bw = max_mem_bw
++        import os
++        self.max_tflops = float(os.environ.get("DCP_PEAK_TFLOPS", max_tflops))
++        self.max_mem_bw = float(os.environ.get("DCP_PEAK_MEMBW", max_mem_bw))
+ 
+     def __repr__(self):
+         return "AttnRooflineCostModel({},{})".format(
+diff --git a/dcp/core/executor.py b/dcp/core/executor.py
+index 7c7cb4f..1aa7d6e 100644
+--- a/dcp/core/executor.py
++++ b/dcp/core/executor.py
+@@ -5,6 +5,7 @@ from typing import Type
+ 
+ from dcp.core.instructions import *  # noqa: F403
+ from dcp.utils.logger import create_logger, read_env_bool
++from dcp.core.serialization import int_to_torch_dtype  # DCP_FP32_OUT
+ 
+ DEBUG_LOG_EXECUTOR = read_env_bool("DCP_DEBUG_LOG_EXECUTOR", default=False)
+ 
+@@ -111,6 +112,12 @@ class DCPExecutor:
+             self.buffer_per_token_shape[buffer_type] = (
+                 buffer_info.per_token_shape
+             )
++            old = self.buffers.get(buffer_type)
++            if (                                 # DCP_FP32_OUT: a persistent buffer (LOCAL_OUT) kept
++                old is not None                  # from the forward plan (fp32) whose backward plan wants the qkv dtype:
++                and old.dtype != int_to_torch_dtype(buffer_info.dtype)   # re-create in the plan's dtype, contents kept
++            ):
++                self.buffers[buffer_type] = old.to(int_to_torch_dtype(buffer_info.dtype))
+             if (
+                 buffer_type not in self.buffers
+                 or self.buffers[buffer_type] is None
+diff --git a/dcp/core/scheduler.py b/dcp/core/scheduler.py
+index ac854ec..fc0257e 100644
+--- a/dcp/core/scheduler.py
++++ b/dcp/core/scheduler.py
+@@ -20,6 +20,7 @@ from dcp.core.common import ExecutionContext
+ from dcp.core.cost_model import CommunicationCostModel
+ from dcp.core.instructions import (
+     BarrierInstr,
++    DType,
+     AttnBackwardInstr,
+     AttnInstr,
+     AttnReductionInstr,
+@@ -45,6 +46,11 @@ from dcp.core.pipeline import (
+ from dcp.utils.common import read_env_int
+ from dcp.utils.logger import Logger, read_env_bool
+ 
++# DCP_FP32_OUT=1: every partial result is stored, sent and summed in fp32 as in the other
++# systems -- forward partial outputs (data/dataloader.py) and backward partial dQ / dK / dV (here; priced at 4 B/elem
++# through the block metas); the kernels still write fp16 and the executor widens the rows they wrote
++_FP32_PARTIAL = os.environ.get("DCP_FP32_OUT", "0") == "1"
++
+ SCHEDULE_LOGGING_ENABLED = read_env_bool("DCP_LOG_SCHEDULE", default=False)
+ SCHEDULE_DUMP_PIPELINE = read_env_bool("DCP_DUMP_PIPELINE", default=False)
+ SCHEDULE_LOG_BUFFER_INFO = read_env_bool("DCP_LOG_BUFFER_INFO", default=False)
+@@ -321,7 +327,8 @@ def convert_forward_to_backward(
+                 fw_kv_id_to_bw_kv_id[fw_kv_id] = bw_kv_id
+ 
+             bw_out_id = len(bw_input_id_to_meta)
+-            bw_out_meta = fw_out_meta
++            bw_out_meta = deepcopy(fw_out_meta)          # the backward's O: qkv dtype (fp32 is only the
++            bw_out_meta.dtype = fw_q_meta.dtype          # forward's partial outputs, DCP_FP32_OUT)
+             bw_input_id_to_meta[bw_out_id] = bw_out_meta
+             bw_device_to_input_map[fw_out_device].append(bw_out_id)
+             fw_out_id_to_bw_out_id[fw_out_id] = bw_out_id
+@@ -336,6 +343,7 @@ def convert_forward_to_backward(
+             bw_dout_id = len(bw_input_id_to_meta)
+             bw_dout_meta = deepcopy(fw_out_meta)
+             bw_dout_meta.type = BlockType.dOut
++            bw_dout_meta.dtype = fw_q_meta.dtype         # dO: qkv dtype
+             bw_input_id_to_meta[bw_dout_id] = bw_dout_meta
+             bw_device_to_input_map[fw_out_device].append(bw_dout_id)
+             bw_seq_head_block_id_to_dout_id[(seq_id, head_id, block_id)] = (
+@@ -345,6 +353,8 @@ def convert_forward_to_backward(
+             bw_dq_id = len(bw_output_id_to_meta)
+             bw_dq_meta = deepcopy(fw_q_meta)
+             bw_dq_meta.type = BlockType.dQ
++            if _FP32_PARTIAL:                            # DCP_FP32_OUT: partial dQ in fp32
++                bw_dq_meta.dtype = DType.FLOAT32
+             bw_output_id_to_meta[bw_dq_id] = bw_dq_meta
+             bw_device_to_output_map[fw_q_device].append(bw_dq_id)
+             bw_seq_head_block_id_to_dq_id[(seq_id, head_id, block_id)] = (
+@@ -355,6 +365,8 @@ def convert_forward_to_backward(
+                 bw_dkv_id = len(bw_output_id_to_meta)
+                 bw_dkv_meta = deepcopy(fw_kv_meta)
+                 bw_dkv_meta.type = BlockType.dKV
++                if _FP32_PARTIAL:                        # DCP_FP32_OUT: partial dK / dV in fp32
++                    bw_dkv_meta.dtype = DType.FLOAT32
+                 bw_output_id_to_meta[bw_dkv_id] = bw_dkv_meta
+                 bw_device_to_output_map[fw_kv_device].append(bw_dkv_id)
+                 fw_kv_id_to_bw_dkv_id[fw_kv_id] = bw_dkv_id
+@@ -486,10 +498,10 @@ def convert_forward_to_backward(
+             BufferType.BUFFER_KV
+         ],
+         BufferType.BUFFER_OUT: fw_workload_spec.block_mapping.buffer_type_to_dtype[
+-            BufferType.BUFFER_OUT
++            BufferType.BUFFER_Q          # backward O / dO: qkv dtype 
+         ],
+         BufferType.BUFFER_dOUT: fw_workload_spec.block_mapping.buffer_type_to_dtype[
+-            BufferType.BUFFER_OUT
++            BufferType.BUFFER_Q
+         ],
+         BufferType.BUFFER_LSE: fw_workload_spec.block_mapping.buffer_type_to_dtype[
+             BufferType.BUFFER_LSE
+@@ -516,6 +528,9 @@ def convert_forward_to_backward(
+             BufferType.BUFFER_LSE
+         ],
+     }
++    if _FP32_PARTIAL:                            # DCP_FP32_OUT: gradient buffers (partial + local) in fp32
++        for bt in (BufferType.BUFFER_dQ, BufferType.BUFFER_dKV, BufferType.LOCAL_dQ, BufferType.LOCAL_dKV):
++            bw_buffer_type_to_dtype[bt] = DType.FLOAT32
+     bw_block_mapping = BlockMappings(
+         bw_input_id_to_meta,
+         bw_output_id_to_meta,
+diff --git a/dcp/data/dataloader.py b/dcp/data/dataloader.py
+index c11f22a..4b9c211 100644
+--- a/dcp/data/dataloader.py
++++ b/dcp/data/dataloader.py
+@@ -1295,15 +1295,20 @@ def _generate_workload(
+     output_id_to_meta: Dict[int, DataBlockMeta] = {}
+     work_id_to_meta: Dict[int, BlockMeta] = {}
+ 
++    # DCP_FP32_OUT=1: forward partial outputs stored, sent and merged in fp32 as in the
++    # other systems (the kernel still writes fp16; the executor widens each output block it wrote, see _handle_attn), and
++    # the planner prices them at fp32 (Out block meta below); the backward keeps O / dO in the qkv dtype (scheduler.py)
++    import os as _os
++    out_dtype = torch.float32 if _os.environ.get("DCP_FP32_OUT", "0") == "1" else qkv_dtype
+     buffer_type_to_dtype = {
+         BufferType.LOCAL_KV: torch_dtype_to_int(qkv_dtype),
+         BufferType.LOCAL_Q: torch_dtype_to_int(qkv_dtype),
+-        BufferType.LOCAL_OUT: torch_dtype_to_int(qkv_dtype),
++        BufferType.LOCAL_OUT: torch_dtype_to_int(out_dtype),
+         BufferType.LOCAL_LSE: DType.FLOAT32,
+         BufferType.LOCAL_dOUT: torch_dtype_to_int(qkv_dtype),
+         BufferType.BUFFER_Q: torch_dtype_to_int(qkv_dtype),
+         BufferType.BUFFER_KV: torch_dtype_to_int(qkv_dtype),
+-        BufferType.BUFFER_OUT: torch_dtype_to_int(qkv_dtype),
++        BufferType.BUFFER_OUT: torch_dtype_to_int(out_dtype),
+         BufferType.BUFFER_LSE: DType.FLOAT32,
+     }
+ 
+@@ -1365,7 +1370,7 @@ def _generate_workload(
+             )
+             output_qkv_meta = DataBlockMeta(
+                 BlockType.Out,
+-                torch_dtype_to_int(qkv_dtype),
++                torch_dtype_to_int(out_dtype),
+                 seq_id,
+                 k,
+                 i,
+diff --git a/dcp/runtime/flash_attention/executor.py b/dcp/runtime/flash_attention/executor.py
+index c30c1a1..2519a1e 100644
+--- a/dcp/runtime/flash_attention/executor.py
++++ b/dcp/runtime/flash_attention/executor.py
+@@ -49,7 +49,9 @@ DEBUG_LOG_REDUCTION_ARGS_ON_ERROR = read_env_bool(
+     "DCP_DEBUG_LOG_REDUCTION_ARGS_ON_ERROR", default=False
+ )
+ 
+-IS_L40 = False  # "L40" in torch.cuda.get_device_name(0)
++# DCP_SMALL_SMEM=1 (default): the 32-token reduction tiles DCP uses on L40, for every GPU with ~100 KB of shared
++# memory per block (sm86): the 64-token tile needs 128 KB when an output gathers many partial blocks.
++IS_L40 = os.environ.get("DCP_SMALL_SMEM", "1") == "1"
+ 
+ 
+ def get_byte_tensor(b: bytes):
+@@ -868,6 +870,19 @@ def _prepare_attn(exec: AttentionExecutor, instr: AttnInstr):
+         device="cuda",
+     )
+     attn_mask = instr.attn_mask.to(torch.int32).cuda()
++    o_buf = exec.buffers[BufferType.BUFFER_OUT]
++    if o_buf.dtype == torch.float32:             # DCP_FP32_OUT: fp16 kernel scratch + the blocks to widen
++        q_dt = exec.buffers[BufferType.BUFFER_Q].dtype
++        if getattr(exec, "_out16", None) is None or exec._out16.shape != o_buf.shape:
++            exec._out16 = torch.zeros(o_buf.shape, dtype=q_dt, device=o_buf.device)
++        if not hasattr(exec, "_out_touched"):
++            exec._out_touched = {}
++        bs = o_buf.shape[1]                      # the token rows this instruction writes (row t of sequence i ->
++        rows = []                                # block out_block_table[i][t // bs], offset t % bs), as flat indices
++        for i, n in enumerate(instr.seqlens_q):
++            tab = instr.out_block_table[i]
++            rows.extend(tab[t // bs].index * bs + t % bs for t in range(n))
++        exec._out_touched[exec.instr_index] = torch.tensor(rows, dtype=torch.long, device="cuda")
+ 
+     exec._args_cache[exec.instr_index] = (
+         total_q,
+@@ -894,6 +909,8 @@ def _handle_attn(exec: AttentionExecutor, instr: AttnInstr):
+         attn_mask,
+     ) = exec._args_cache[exec.instr_index]
+ 
++    o_buf = exec.buffers[BufferType.BUFFER_OUT]
++    wide = o_buf.dtype == torch.float32          # DCP_FP32_OUT (the kernel writes fp16 only)
+     # lse block table is the same as out
+     _wrapped_flash_attn_varlen_forward(
+         exec.buffers[BufferType.BUFFER_Q],
+@@ -907,9 +924,13 @@ def _handle_attn(exec: AttentionExecutor, instr: AttnInstr):
+         q_block_table=cu_q_block_table,
+         kv_block_table=cu_kv_block_table,
+         out_block_table=cu_out_block_table,
+-        out_=exec.buffers[BufferType.BUFFER_OUT],
++        out_=exec._out16 if wide else o_buf,
+         lse_=exec.buffers[BufferType.BUFFER_LSE],
+     )
++    if wide:                                     # the output blocks this instruction wrote, fp16 -> fp32
++        idx = exec._out_touched[exec.instr_index]
++        o_flat = o_buf.view(-1, *o_buf.shape[2:])
++        _widen_rows(o_flat, exec._out16.view(-1, *o_buf.shape[2:]), idx)
+     torch.cuda.nvtx.range_pop()
+ 
+ 
+@@ -951,6 +972,27 @@ def _prepare_attn_bw(exec: AttentionExecutor, instr: AttnBackwardInstr):
+         exec.buffer_per_token_shape[BufferType.BUFFER_dKV][-2]
+         != exec.buffer_per_token_shape[BufferType.BUFFER_dQ][-2]
+     )
++    # DCP_FP32_OUT: fp32 gradient buffers; the kernel writes fp16 scratches of the same layout and
++    # the rows it wrote are widened into the fp32 buffers after each call (_handle_attn_bw)
++    q_dt = exec.buffers[BufferType.BUFFER_Q].dtype
++    wide = exec.buffers[BufferType.BUFFER_dQ].dtype == torch.float32
++    if wide:
++        for nm, bt in (("_dq16", BufferType.BUFFER_dQ), ("_dkv16", BufferType.BUFFER_dKV)):
++            b = exec.buffers[bt]
++            if getattr(exec, nm, None) is None or getattr(exec, nm).shape != b.shape:
++                setattr(exec, nm, torch.zeros(b.shape, dtype=q_dt, device=b.device))
++        if not hasattr(exec, "_grad_rows"):
++            exec._grad_rows = {}
++
++        def _rows(tables, seqlens, bs):
++            r = []
++            for i, n in enumerate(seqlens):
++                r.extend(tables[i][t // bs].index * bs + t % bs for t in range(n))
++            return torch.tensor(r, dtype=torch.long, device="cuda")
++        exec._grad_rows[exec.instr_index] = (
++            _rows(instr.dq_block_table, instr.seqlens_q, exec.buffers[BufferType.BUFFER_dQ].shape[1]),
++            _rows(instr.dkv_block_table, instr.seqlens_kv, exec.buffers[BufferType.BUFFER_dKV].shape[1]))
++    dkv_dst = exec._dkv16 if wide else exec.buffers[BufferType.BUFFER_dKV]
+     if is_gqa:
+         # for GQA backward, we need to create a temporary dedicated dkv buffer
+         # (and rewrite the block_table)
+@@ -962,7 +1004,7 @@ def _prepare_attn_bw(exec: AttentionExecutor, instr: AttnBackwardInstr):
+             2,
+             exec.buffer_per_token_shape[BufferType.BUFFER_dKV][-2],
+             exec.buffer_per_token_shape[BufferType.BUFFER_dKV][-1],
+-            dtype=exec.buffers[BufferType.BUFFER_dKV].dtype,
++            dtype=dkv_dst.dtype,
+             device="cuda",
+         )
+         tmp_dkv_block_table = []
+@@ -987,9 +1029,7 @@ def _prepare_attn_bw(exec: AttentionExecutor, instr: AttnBackwardInstr):
+                 src_block_index = curr_n_blocks + i
+                 dst_block_index = block.index
+                 src_ptr = dkv_buffer[src_block_index].data_ptr()
+-                dst_ptr = exec.buffers[BufferType.BUFFER_dKV][
+-                    dst_block_index
+-                ].data_ptr()
++                dst_ptr = dkv_dst[dst_block_index].data_ptr()
+                 n_tokens = block.n_tokens
+                 dkv_cpy_src_ptrs.append(src_ptr)
+                 dkv_cpy_dst_ptrs.append(dst_ptr)
+@@ -1071,11 +1111,12 @@ def _handle_attn_bw(exec: AttentionExecutor, instr: AttnBackwardInstr):
+         cu_dkv_block_table,
+     ) = exec._args_cache[exec.instr_index]
+ 
++    wide = exec.buffers[BufferType.BUFFER_dQ].dtype == torch.float32   # DCP_FP32_OUT
+     if exec.instr_index in exec._gqa_dkv_args:
+         dkv_buffer, dkv_cpy_args = exec._gqa_dkv_args[exec.instr_index]
+         dkv_buffer.zero_()
+     else:
+-        dkv_buffer = exec.buffers[BufferType.BUFFER_dKV]
++        dkv_buffer = exec._dkv16 if wide else exec.buffers[BufferType.BUFFER_dKV]
+ 
+     _wrapped_flash_attn_varlen_backward(
+         exec.buffers[BufferType.BUFFER_dOUT],
+@@ -1095,7 +1136,7 @@ def _handle_attn_bw(exec: AttentionExecutor, instr: AttnBackwardInstr):
+         out_block_table=cu_out_block_table,
+         dq_block_table=cu_dq_block_table,
+         dkv_block_table=cu_dkv_block_table,
+-        dq=exec.buffers[BufferType.BUFFER_dQ],
++        dq=exec._dq16 if wide else exec.buffers[BufferType.BUFFER_dQ],
+         dkv=dkv_buffer,
+     )
+ 
+@@ -1112,9 +1153,27 @@ def _handle_attn_bw(exec: AttentionExecutor, instr: AttnBackwardInstr):
+         copy_fn(
+             *dkv_cpy_args,
+         )
++    if wide:                                     # the gradient rows this instruction wrote, fp16 -> fp32
++        for (src, dst), idx in zip(((exec._dq16, exec.buffers[BufferType.BUFFER_dQ]),
++                                    (exec._dkv16, exec.buffers[BufferType.BUFFER_dKV])), exec._grad_rows[exec.instr_index]):
++            d = dst.view(-1, *dst.shape[2:])
++            _widen_rows(d, src.view(-1, *dst.shape[2:]), idx)
+     torch.cuda.nvtx.range_pop()
+ 
+ 
++def _widen_rows(dst, src, idx, max_tmp=1 << 30):
++    """dst[idx] = src[idx] widened to fp32; above max_tmp bytes of fp32 temporary the copy runs in row chunks
++    (identical values, bounded temporary memory)."""
++    row = src[0].numel() * 4 if src.shape[0] else 4
++    if idx.numel() * row <= max_tmp:
++        dst.index_copy_(0, idx, src.index_select(0, idx).to(torch.float32))
++        return
++    step = max(1, max_tmp // row)
++    for i in range(0, idx.numel(), step):
++        j = idx[i:i + step]
++        dst.index_copy_(0, j, src.index_select(0, j).to(torch.float32))
++
++
+ def _round_to_pow_2(x: int):
+     return 1 << (x - 1).bit_length()
+ 
+diff --git a/dcp/runtime/flash_attention/utils.py b/dcp/runtime/flash_attention/utils.py
+index 19dc523..1ccfb86 100644
+--- a/dcp/runtime/flash_attention/utils.py
++++ b/dcp/runtime/flash_attention/utils.py
+@@ -1,3 +1,4 @@
++import os
+ import pickle
+ from typing import Dict, List, Tuple, Optional
+ 
+@@ -525,6 +526,22 @@ def lambda_mask_fn(
+     return attn_mask
+ 
+ 
++def ranges_file_mask_fn(
++    raw_seqlens: List[int],
++    padded_seqlens: List[int],
++    mask_dtype: torch.dtype,
++    mask_fn_info: Optional[List[Dict]] = None,
++):
++    """Per-token key ranges from a file (env DCP_RANGES_FILE, .npy int [S, 2, 2]: two
++    [start, end) ranges per query token, in DCP's own two-range format), one sequence: real rollout masks (a star's
++    token sees the prompt + its own reply causally) on the UNPADDED token sequence. Padded rows stay empty."""
++    r = np.load(os.environ["DCP_RANGES_FILE"])
++    assert len(raw_seqlens) == 1 and r.shape[0] == raw_seqlens[0], (r.shape, raw_seqlens)
++    attn_mask = torch.zeros((sum(padded_seqlens), 2, 2), dtype=mask_dtype)
++    attn_mask[: r.shape[0]] = torch.from_numpy(r).to(mask_dtype)
++    return attn_mask
++
++
+ def causal_range_mask_fn(
+     raw_seqlens: List[int],
+     padded_seqlens: List[int],

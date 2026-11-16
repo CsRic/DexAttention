@@ -1,0 +1,26 @@
+Changes applied to the CUTLASS submodule of infllmv2_cuda_impl (https://github.com/zhangyan-didu/cutlass) @ 424c5a0 for the evaluation:
+- include/cutlass/cuda_host_adapter.hpp: the two CUDA-version conditionals are preprocessor directives on
+  __CUDACC_VER_MAJOR__ / __CUDACC_VER_MINOR__, so that the InfLLM-v2 extension (infllm_v2.C, used by W4) compiles.
+
+diff --git a/include/cutlass/cuda_host_adapter.hpp b/include/cutlass/cuda_host_adapter.hpp
+index 32273dd..918a9b7 100644
+--- a/include/cutlass/cuda_host_adapter.hpp
++++ b/include/cutlass/cuda_host_adapter.hpp
+@@ -100,7 +100,7 @@ namespace cutlass {
+ 
+ #else // defined(CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL)
+ 
+-if ((CUDACC_VER_MAJOR > 12) || (CUDACC_VER_MAJOR == 12 && CUDACC_VER_MINOR >= 5))
++#if ((__CUDACC_VER_MAJOR__ > 12) || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 5))
+ 
+ #define CUTLASS_CUDA_DRIVER_WRAPPER_DECL(func, ver)             \
+   template <typename... Args>                                   \
+@@ -142,7 +142,7 @@ if ((CUDACC_VER_MAJOR > 12) || (CUDACC_VER_MAJOR == 12 && CUDACC_VER_MINOR >= 5)
+ 
+ #endif // defined(CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL)
+ 
+-if ((CUDACC_VER_MAJOR > 12) || (CUDACC_VER_MAJOR == 12 && CUDACC_VER_MINOR >= 5))
++#if ((__CUDACC_VER_MAJOR__ > 12) || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 5))
+ CUTLASS_CUDA_DRIVER_WRAPPER_DECL(cuTensorMapEncodeTiled, 12000);
+ CUTLASS_CUDA_DRIVER_WRAPPER_DECL(cuTensorMapEncodeIm2col, 12000);
+ #endif

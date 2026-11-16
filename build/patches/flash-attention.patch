@@ -1,0 +1,22 @@
+# Changes applied to flash-attention @ 6c4f74fb338e0c3cdb07ac6f5eab5f54fc367c15 (tag fa4-v4.0.0.beta15) for the evaluation:
+# hopper/epilogue_fwd.hpp gains an optional template parameter for the partial-O element type; its default keeps the store unchanged.
+diff --git a/hopper/epilogue_fwd.hpp b/hopper/epilogue_fwd.hpp
+--- a/hopper/epilogue_fwd.hpp
++++ b/hopper/epilogue_fwd.hpp
+@@ -21,13 +21,14 @@ namespace flash {
+ using namespace cute;
+ 
+ template <class TileShape_MNK_PV_, class ClusterShape_, class Element_, class ArchTag_,
+-          int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool Split_, bool FP8PermuteCol=false>
++          int NumEpilogueThreads_, bool Varlen_, bool PackGQA_, bool Split_, bool FP8PermuteCol=false,
++          class ElementPartial_ = float>
+ struct CollectiveEpilogueFwd {
+ 
+     using TileShape_MNK_PV = TileShape_MNK_PV_;
+     using ClusterShape = ClusterShape_;
+     using Element = Element_;
+-    using ElementPartial = float;
++    using ElementPartial = ElementPartial_;
+     using ArchTag = ArchTag_;
+     static constexpr int NumEpilogueThreads = NumEpilogueThreads_;
+     static constexpr bool Varlen = Varlen_;

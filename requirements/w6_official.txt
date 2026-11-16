@@ -1,0 +1,14 @@
+# W6 reference and data: the official single-device FlexPrefill prefill (workloads/w6_flexprefill/dump_qkv.py, official_reference.py).
+# Python 3.10.22; torch built for CUDA 12.1; no extension build. FlexPrefill pins transformers 4.44 and triton 3.0, so this is its own environment.
+# Not on PyPI: third_party/flex_prefill, installed with `pip install -e third_party/flex_prefill`.
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.4.0+cu121
+numpy==1.26.4
+einops==0.8.2
+safetensors==0.8.0
+transformers==4.44.0
+tokenizers==0.19.1
+sentencepiece==0.2.2
+accelerate==1.15.0
+triton==3.0.0
+flash-attn @ https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.4cxx11abiFALSE-cp310-cp310-linux_x86_64.whl

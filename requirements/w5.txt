@@ -1,0 +1,26 @@
+# W5 (operator tests, end-to-end) and its data: SGLang Diffusion generations with SpargeAttn, Wan latents and text embeddings.
+# Python 3.11.17; torch built for CUDA 12.9. The Dex extension was compiled with nvcc 12.9.86 and SpargeAttn with nvcc 12.6.85.
+# This environment gets its own extension build:
+#   DEX_PYTHON=<python> DEX_CUDA_HOME=<12.9> bash build/build_ext.sh --out <DIR>     run with DEX_EXT_DIR=<DIR>
+# Not on PyPI: third_party/SpargeAttn (spas_sage_attn), built with
+#   cd third_party/SpargeAttn && CUDA_HOME=<12.6> PATH=<12.6>/bin:$PATH <python> setup.py build_ext --inplace
+# and put on the path of this environment (`pip install --no-deps --no-build-isolation -e .`, or a .pth file in site-packages).
+# NVSHMEM 3.7.1 (DEX_NVSHMEM_HOME).
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch==2.13.0+cu129
+numpy==2.3.5
+einops==0.9.0.dev0
+safetensors==0.9.0rc1
+transformers==5.12.1
+tokenizers==0.22.2
+sentencepiece==0.2.1
+diffusers==0.37.0
+triton==3.7.1
+av==16.1.0
+imageio==2.36.0
+imageio-ffmpeg==0.5.1
+psutil==7.2.2
+ninja==1.13.2
+setuptools==83.0.0
+sglang==0.5.21
+sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.6.post1/sglang_kernel-0.4.6.post1+cu129-cp310-abi3-manylinux2014_x86_64.whl

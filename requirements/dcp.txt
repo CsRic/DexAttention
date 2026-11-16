@@ -1,0 +1,21 @@
+# DCP baseline (DEX_DCP_PYTHON): a virtual environment on top of requirements/core.txt, `python -m venv --system-site-packages`.
+# Python 3.11.11. torch 2.5.1 comes from DCP's PyTorch fork with zero-byte all_to_all, built for CUDA 12.1 and installed in this
+# environment over core's torch; the build is in third_party/PINS.md.
+# Not on PyPI, in this order, once this file is installed:
+#   pip install --no-deps -e git+https://github.com/chenyu-jiang/pypatoh.git@884317e3d18dc1c1c7c7556b1edd45556b0817d1#egg=pypatoh     (PATOH_PATH: the PaToH library)
+#   pip install --no-deps --no-build-isolation -e third_party/dcp_flash_attention      (package dcp_flash_attn)
+#   pip install --no-deps --no-build-isolation -e third_party/dcp                      (with its C++ module dcp_cpp)
+# A redis-server binary (evaluated 8.10.2) is given by DEX_REDIS_SERVER.
+# DCP's driver and ring-flash-attn import a package named flash_attn when they load, while DCP's kernels are dcp_flash_attn:
+# keep DEX_FA283_PATH on PYTHONPATH in this environment.
+kahypar==1.3.7
+mtkahypar==1.6.2
+ortools==9.15.6755
+immutabledict==4.3.1
+protobuf==6.33.6
+redis==8.1.0
+ring-flash-attn==0.1.8
+termcolor==3.3.0
+triton==3.2.0
+pybind11==3.0.1
+setuptools==65.5.0

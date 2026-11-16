@@ -1,0 +1,15 @@
+Changes applied to SpargeAttn (https://github.com/thu-ml/SpargeAttn) @ ae5b629 for the evaluation:
+- setup.py: nvcc no longer force-includes <cassert> (with GCC 12 this redefines std::__terminate; the sm_80 kernels the
+  A5000 runs do not need it).
+
+diff --git a/setup.py b/setup.py
+--- a/setup.py
++++ b/setup.py
+@@ -62,7 +62,6 @@ NVCC_FLAGS = [
+     "--threads=8",
+     "-Xptxas=-v",
+     "-diag-suppress=174", # suppress the specific warning
+-    "-Xcompiler", "-include,cassert", # fix error occurs when compiling for SM90+ with newer CUDA toolkits
+ ]
+ 
+ ABI = 1 if torch._C._GLIBCXX_USE_CXX11_ABI else 0

@@ -1,0 +1,53 @@
+{
+  "_about": "Machine constants of the Dex planner's cost model (dex/planner/models.py) and the scheduler's link model (dex/scheduler/fwd.py, bwd.py), for the evaluation cluster (4 nodes x 4 RTX A5000, PCIe without NVLink, one 200 Gb/s InfiniBand NIC per node). They are the article's three kinds of constant: compute rate (t_tile_s with a_comp, the backward coef with k_comp, the InfLLM entry times), link bandwidth (b_*, bw_*, kappa, c_arr_s, lat_*) and fixed tail (gamma, c_end_s, c0_s, gamma_local). Each kind has one entry per compute routine, pass or link the implementation uses; the file is measured once per cluster and the same values serve every workload and both passes. The constants only rank candidate plans; they are not meant to reproduce measured latencies. On another cluster, measure per-tile, per-task / per-item and per-entry times with single-GPU runs of each routine, bandwidths and latencies with point-to-point transfers, and the dimensionless factors and fixed costs from a few plan executions there. Units are in each key's suffix: _s seconds, _gib_s GiB/s (2^30 bytes per second), _b_s bytes per second, no suffix = dimensionless.",
+  "forward": {
+    "_about": "Forward model: per GPU score = max(a_comp * compute, arrival + gamma * a_comp * compute that waits for inter-node inputs) + c_end; node arrival from NIC bytes (kappa = share of the opposite direction's bytes on the same NIC) + c_arr. t_tile_s: per-tile time of a single-GPU dense pass; a_comp: its scale to the per-tile time inside a distributed plan. gamma_local: tail weight of intra-node bytes in the GPU-level KV re-split's local view.",
+    "t_tile_s": 3.4e-06,
+    "a_comp": 1.13,
+    "gamma": 0.65,
+    "c_end_s": 0.0005,
+    "b_nic_gib_s": 11.25,
+    "kappa": 0.8,
+    "b_intra_gib_s": 10.0,
+    "c_arr_s": 0.002,
+    "bw_fw_gib_s": 16.0,
+    "gamma_local": 0.05
+  },
+  "backward": {
+    "_about": "Backward model: compute = item time x items + task time x tasks; per GPU score = max(k_comp * compute, copy-engine bytes / b_eng, NIC time) + c0. task_s / item_s are single-GPU times of 63 tasks / 63 items of the backward routine for each (query heads, KV heads) shape; the model divides by 63. The MHA shapes 8x8 and 4x4 use the 16x16 times: on equal query and KV heads the routine's time scales with the head count, which the model already applies (items x 4 query heads, tasks x 2 KV heads).",
+    "k_comp": 0.859,
+    "b_eng_b_s": 12153000000.0,
+    "b_nic_b_s": 19636000000.0,
+    "kappa": 1.921,
+    "c0_s": 1e-06,
+    "gamma_local": 0.25,
+    "profile_count": 63,
+    "coef": {
+      "32x2":  {"task_s": 346.4e-6, "item_s": 5764.3e-9},
+      "32x8":  {"task_s": 129.0e-6, "item_s": 5742.1e-9},
+      "1x1":   {"task_s": 87.2e-6,  "item_s": 5375.2e-9},
+      "16x16": {"task_s": 110.2e-6, "item_s": 7236.3e-9},
+      "16x1":  {"task_s": 344.2e-6, "item_s": 5810.2e-9},
+      "4x1":   {"task_s": 155.2e-6, "item_s": 5906.7e-9},
+      "8x8":   {"task_s": 110.2e-6, "item_s": 7236.3e-9},
+      "4x4":   {"task_s": 110.2e-6, "item_s": 7236.3e-9},
+      "16x4":  {"task_s": 127.0e-6, "item_s": 5939.5e-9},
+      "8x2":   {"task_s": 134.8e-6, "item_s": 5930.3e-9}
+    }
+  },
+  "infllm": {
+    "_about": "InfLLM-v2 planner: seconds per entry (one token x one selected 64-key block, 16 query heads) of the official forward row routine / backward column routine on one GPU, measured on selections at 32K / 64K / 128K tokens.",
+    "t_entry_fwd_s": 1.824e-8,
+    "t_entry_bwd_s": 3.442e-8
+  },
+  "links": {
+    "_about": "Scheduler link model: per-message transfer time = latency + bytes / bandwidth on its link.",
+    "bw_inter_gib_s": 2.5,
+    "bw_intra_gib_s": 8.0,
+    "bw_fw_gib_s": 16.0,
+    "lat_inter_s": 1e-05,
+    "lat_intra_s": 5e-06,
+    "bwd_item_s": 5764e-9,
+    "_bwd_item_s": "backward scheduler's work estimate: single-GPU time of 63 items (the scheduler divides by backward.profile_count)"
+  }
+}

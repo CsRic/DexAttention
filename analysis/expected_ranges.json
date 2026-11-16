@@ -1,0 +1,83 @@
+{
+  "_about": "Values reported in the evaluation, used by check_expected.py; the records behind them are not distributed, the experiments write new ones. Launch-to-launch variability on the evaluation cluster: per-case difference median 0.6%, 95th percentile 3.3%, maximum 15.9% over 3521 case-quantity pairs (operator tests and W6 prefill). A regenerated group-level ratio on the same hardware should fall within rel_tolerance of the reported value; rel_tolerance is 2x the 95th percentile unless an entry states its own. Other hardware: compare trends, not values.",
+  "variability": {"median_pct": 0.6, "p95_pct": 3.3},
+  "rel_tolerance": 0.066,
+  "fig6a_speedup_vs_strongest": {
+    "W1 32K": [4.45], "W1 64K": [9.62], "W1 128K": [9.82], "W1 256K": [7.15],
+    "W2 ~32K": [2.37], "W2 ~64K": [2.17], "W2 ~128K": [1.94],
+    "W3 ~32K": [1.71], "W3 ~64K": [1.20], "W3 ~128K": [1.08],
+    "W4 32K": [1.15, 1.49], "W4 64K": [1.30, 1.51], "W4 128K": [1.35, 1.46],
+    "W5 480p": [2.11, 1.84], "W5 720p": [2.37, 1.68],
+    "W6 32K": [1.00, 1.31], "W6 64K": [1.18, 1.38], "W6 128K": [1.07, 1.17]
+  },
+  "fig6b_speedup_vs_strongest": {
+    "W2 32K": [2.02], "W2 64K": [2.00], "W2 128K": [1.72],
+    "W3 32K": [1.34], "W3 64K": [1.16], "W3 128K": [1.06],
+    "W4 32K": [1.00, 1.06], "W4 64K": [1.08, 1.11], "W4 128K": [1.12, 1.14],
+    "W5 480p": [1.68, 1.54], "W5 720p": [1.56, 1.14],
+    "W6 32K": [0.98, 1.11], "W6 64K": [1.07, 1.16], "W6 128K": [1.07, 1.11]
+  },
+  "training_headline": 1.39,
+  "w4_non_attention_share": [0.72, 0.82],
+  "w6_selection_share": [0.24, 0.31],
+  "w6_assignment_added_fraction": [0.05, 0.13],
+  "table1_table4_planning": {
+    "ua_s": [0.9, 116], "ua_timeouts": [14, 104], "dcp_s": [6.4, 111], "magi_s": [0.03, 0.76],
+    "dex_static_ms": [12, 19], "dex_dynamic_ms": [6, 23], "dex_no_assigner_dynamic_ms": [2, 18],
+    "assignment_w5_w6_ms": [4.9, 6.3]
+  },
+  "table2": {
+    "128": {"fa2_ms": 0.09, "tflops": 1.4, "intra_ms": 0.14, "inter_ms": 0.63},
+    "2048": {"fa2_ms": 0.45, "tflops": 76.8, "intra_ms": 0.85, "inter_ms": 9.30},
+    "8192": {"fa2_ms": 6.54, "tflops": 84.0, "intra_ms": 3.14, "inter_ms": 36.7},
+    "floor": {"intra_ms": 0.08, "inter_ms": [0.09, 0.14]},
+    "dex": {"tile_ms": 0.0018, "tflops": 76, "intra_ms": 0.005, "inter_ms": 0.010, "launch_ms": 0.07}
+  },
+  "table4": {
+    "imbalance": {
+      "Dex": [1.04, 1.21, 1.19, 1.06, 1.31, 1.11], "Ring": [1.03, 1.24, 1.23, 1.06, 1.05, 1.11],
+      "All-gather": [null, null, null, 1.06, 1.05, 1.11], "Magi": [1.03, 1.01, 1.01, null, null, null],
+      "DCP": [1.06, 1.44, 1.36, null, null, null], "UA": [1.02, 1.08, 1.07, null, null, null]
+    },
+    "nic_mib": {
+      "Dex": [32, 336, 193, 48, 126, 152], "Ring": [762, 685, 350, 60, 277, 240],
+      "All-gather": [null, null, null, 60, 277, 192], "Magi": [559, 1355, 699, null, null, null],
+      "DCP": [93, 365, 242, null, null, null], "UA": [183, 1102, 900, null, null, null]
+    },
+    "direct_fetch_mib": [39, 438, 558, 182, 146, 499],
+    "measured_over_direct": [0.26, 0.86],
+    "less_than_allgather": {"W4": 0.20, "W6": 0.21},
+    "exposed_planning_pct": {"w4": [2.6, 4.9], "w5_fwd": [5, 9], "w5_hidden_bwd": [6, 10]}
+  },
+  "table5": {
+    "ua": [5.33, 2.21, 1.75], "dcp": [4.25, 1.22, 1.09], "magi": [4.64, 4.00, 2.14], "ring": [3.55, null, 1.39],
+    "dynamic": {"ring_native": 1.33, "executor": 0.89}
+  },
+  "component_internal": {
+    "load_only": [1.76, 2.39], "no_relay": [1.33, 1.22], "fifo_max_change_pct": 1.0
+  },
+  "mask_stats": {
+    "w4_largest_gpu_coverage": [0.99, 1.0], "w5_density": [0.04, 0.05], "w6_density": [0.25, 0.25], "w6_need_over_allgather": [0.63, 0.71]
+  },
+  "table6": {
+    "W1": [2.54, 2.56, 2.57], "W2": [2.43, 2.38, 2.40], "W3": [2.72, 2.10, 2.27], "W4": [2.34, 3.63, 3.18],
+    "W5": [1.58, 1.47, 1.50], "W6": [2.47, null, null], "W4_fwd_incl_planning": 1.95
+  },
+  "table7_gib": {
+    "_order": ["dex", "ring", "allgather", "dcp", "ua", "magi"],
+    "W2|32K": [7.5, 6.4, 6.5, 10.8, 7.5, 6.6], "W2|64K": [8.9, 7.2, 9.0, 13.9, null, 9.4], "W2|128K": [10.5, 8.1, 11.5, 19.0, null, 13.5],
+    "W3|32K": [11.2, 10.2, 10.2, 15.5, 11.4, 10.1], "W3|64K": [13.7, 12.1, 12.5, 22.1, null, 12.8], "W3|128K": [16.4, 14.2, 15.5, null, 17.6, 16.5],
+    "W4|32K": [13.0, 12.2, 11.6], "W4|64K": [15.6, 14.5, 13.4], "W4|128K": [20.1, 18.1, 16.1],
+    "W5|480p": [7.9, 6.7, 7.9], "W5|720p": [9.5, 7.7, 10.6],
+    "W6|32K": [16.6, 15.7, 15.8], "W6|64K": [17.2, 16.0, 16.2], "W6|128K": [18.8, 17.1, 17.1]
+  },
+  "correctness": {
+    "dex_w1_w3_worst_rel_l2": 3.0e-4, "dex_w4_w5_worst_rel_l2": 4.7e-3, "training_loss_max_rel_diff": 2.7e-3,
+    "_note": "relative L2 against FP64 on sampled rows; compare as upper bounds. The training-loss value is the corrected one, see docs/reproduction.md, Result notes"
+  },
+  "training_reported_unavailable": {
+    "_note": "reference values, not compared: training configurations without a result in the article (TLE: no plan within the planner's time limit; OOM: out of memory). The regenerated Table 7 and Figure 6(b) state a reason only where a record states it",
+    "W2|64K": {"ua": "TLE"}, "W2|128K": {"ua": "TLE"}, "W3|64K": {"ua": "TLE"}, "W3|128K": {"dcp": "OOM"}
+  },
+  "fig7": {"topk_32_nodes_assigner_ms": [21, 28]}
+}

@@ -1,0 +1,11 @@
+# Magi baseline (DEX_MAGI_PYTHON): a virtual environment on top of requirements/core.txt, `python -m venv --system-site-packages`.
+# Python 3.11.11; torch 2.5.1+cu121 of the core environment; nvcc 12.1.
+# Not on PyPI: third_party/magiattention and its flash-attention submodule (FA4 backend), installed as in third_party/PINS.md.
+nvidia-cutlass-dsl==4.4.2
+nvidia-cutlass-dsl-libs-base==4.4.2
+apache-tvm-ffi==0.1.8.post0
+quack-kernels==0.4.1
+versioningit==3.3.0
+cuda-python==13.4.4
+debugpy==1.8.22
+setuptools==80.9.0

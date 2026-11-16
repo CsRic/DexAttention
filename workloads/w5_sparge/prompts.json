@@ -1,0 +1,56 @@
+{
+ "source": "Vchitect/VBench",
+ "commit": "fd18b3d055cb0fc6f066ca90fe2c3c8cbb698490",
+ "files": "prompts/prompts_per_dimension/<dim>.txt",
+ "rule": "per dimension: numpy default_rng(0) permutation, first 2 distinct prompts (dedup across dimensions); dimensions in this order",
+ "seeds": [
+  0,
+  1
+ ],
+ "resolutions": [
+  "480p",
+  "720p"
+ ],
+ "prompts": [
+  {
+   "dimension": "object_class",
+   "line": 51,
+   "prompt": "broccoli"
+  },
+  {
+   "dimension": "object_class",
+   "line": 6,
+   "prompt": "a bus"
+  },
+  {
+   "dimension": "human_action",
+   "line": 71,
+   "prompt": "A person is crawling baby"
+  },
+  {
+   "dimension": "human_action",
+   "line": 73,
+   "prompt": "A person is driving car"
+  },
+  {
+   "dimension": "scene",
+   "line": 8,
+   "prompt": "ballroom"
+  },
+  {
+   "dimension": "scene",
+   "line": 49,
+   "prompt": "indoor library"
+  },
+  {
+   "dimension": "spatial_relationship",
+   "line": 4,
+   "prompt": "a bus on the right of a traffic light, front view"
+  },
+  {
+   "dimension": "spatial_relationship",
+   "line": 18,
+   "prompt": "a bear on the right of a zebra, front view"
+  }
+ ]
+}

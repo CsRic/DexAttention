@@ -1,0 +1,18 @@
+[[0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4]]
+SIZE 8192, REAL_BD 1.076 GB/s, BD/PAIR 0.135 GB/s, time 1.134e-02 s, time/iter 5.670e-05, comm_vol 0.066 MB
+SIZE 16384, REAL_BD 2.194 GB/s, BD/PAIR 0.274 GB/s, time 1.113e-02 s, time/iter 5.564e-05, comm_vol 0.131 MB
+SIZE 32768, REAL_BD 3.982 GB/s, BD/PAIR 0.498 GB/s, time 1.226e-02 s, time/iter 6.131e-05, comm_vol 0.262 MB
+SIZE 65536, REAL_BD 7.805 GB/s, BD/PAIR 0.976 GB/s, time 1.251e-02 s, time/iter 6.256e-05, comm_vol 0.524 MB
+SIZE 131072, REAL_BD 18.285 GB/s, BD/PAIR 2.286 GB/s, time 1.068e-02 s, time/iter 5.341e-05, comm_vol 1.049 MB
+SIZE 262144, REAL_BD 36.849 GB/s, BD/PAIR 4.606 GB/s, time 1.060e-02 s, time/iter 5.300e-05, comm_vol 2.097 MB
+SIZE 524288, REAL_BD 72.423 GB/s, BD/PAIR 9.053 GB/s, time 1.079e-02 s, time/iter 5.394e-05, comm_vol 4.194 MB
+SIZE 1048576, REAL_BD 89.363 GB/s, BD/PAIR 11.170 GB/s, time 1.748e-02 s, time/iter 8.742e-05, comm_vol 8.389 MB
+SIZE 2097152, REAL_BD 88.117 GB/s, BD/PAIR 11.015 GB/s, time 3.546e-02 s, time/iter 1.773e-04, comm_vol 16.777 MB
+SIZE 4194304, REAL_BD 98.229 GB/s, BD/PAIR 12.279 GB/s, time 6.363e-02 s, time/iter 3.181e-04, comm_vol 33.554 MB
+SIZE 8388608, REAL_BD 109.763 GB/s, BD/PAIR 13.720 GB/s, time 1.139e-01 s, time/iter 5.694e-04, comm_vol 67.109 MB
+SIZE 16777216, REAL_BD 114.560 GB/s, BD/PAIR 14.320 GB/s, time 1.298e-01 s, time/iter 1.091e-03, comm_vol 134.218 MB
+SIZE 33554432, REAL_BD 109.025 GB/s, BD/PAIR 13.628 GB/s, time 1.353e-01 s, time/iter 2.293e-03, comm_vol 268.435 MB
+SIZE 67108864, REAL_BD 115.880 GB/s, BD/PAIR 14.485 GB/s, time 1.251e-01 s, time/iter 4.315e-03, comm_vol 536.871 MB
+SIZE 134217728, REAL_BD 116.316 GB/s, BD/PAIR 14.540 GB/s, time 1.204e-01 s, time/iter 8.597e-03, comm_vol 1073.742 MB
+SIZE 268435456, REAL_BD 116.217 GB/s, BD/PAIR 14.527 GB/s, time 1.205e-01 s, time/iter 1.721e-02, comm_vol 2147.484 MB
+# empty-step latency 53.5 us; 8 ranks, all sending concurrently

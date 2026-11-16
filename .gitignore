@@ -1,0 +1,38 @@
+# machine-specific configuration (copy config/env.example.sh to config/env.sh)
+config/env.sh
+config/hostfile
+
+# build products
+build/*.log
+*.so
+*.o
+*.a
+*.pyc
+__pycache__/
+*.egg-info/
+dex/scheduler/lib/
+dex/*.so
+.eggs/
+
+# experiment outputs (DEX_RESULT_ROOT defaults to ./results)
+results/
+analysis/out/
+
+# data and checkpoints never live in the tree
+data/
+models/
+*.npz
+*.npy
+*.pkl
+*.pt
+*.safetensors
+
+# third-party checkouts are git submodules; their own build dirs are ignored
+third_party/*/build/
+third_party/*/dist/
+
+# editors and tooling
+.vscode/
+.idea/
+*.swp
+.DS_Store

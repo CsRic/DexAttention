@@ -1,0 +1,2 @@
+# Dex on W1-W3 and the Ring, All-gather and UA baselines; the other environments are listed in requirements/ (docs/reproduction.md).
+-r requirements/core.txt

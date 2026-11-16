@@ -1,0 +1,2288 @@
+Changes applied to UltraAttn (https://github.com/oliverYoung2001/UltraAttn) @ b5aa10e for the evaluation:
+- search_algo/dcp_adapter.py, dcp_in_ultraattn.py, dump_plan_structure.py (added): build UltraAttn's dependent graph,
+  fusion search and ILP schedule for a given block problem + deployment (from baselines/ua/deploy.py) and dump the
+  resulting execution plan (owner, schedule_table, gpu_kernels) as JSON; --batch builds many plans in one process
+  with per-task timing; --fob 1 builds the backward plan.
+- graph_transformation_engine.py: transform mode 'ua_greedy' (UltraAttn's greedy fusion with a time budget,
+  UA_FUSION_BUDGET_S) and mode 'none'; fused kernels enumerated over global GPU ids of a flat schedule table.
+- dcp_in_ultraattn.py / search_engine.py / bsa_utils.py: kernel cost lookup by FLOP-linear rate when a fused shape is
+  not profiled (UA_FAITHFUL=1: the executor's measured profile, log-log interpolation); profile keys for every reduced
+  Q/KV length ratio up to 8; GQA head counts (--kv-heads); live-work scaling of partial blocks (dependent_graph.py).
+- workload_partition.py: balance cap relaxed until the ILP is feasible; backward MCV coefficients.
+- initialize.py / task1_bsa.py / task2_bsa.py / exp_configs.py / intra_attn_gen.py: torchrun launch, GPU bound before
+  NCCL init, collective group creation on all ranks, node size from the environment (UA_GPU_PER_NODE, UA_CPS,
+  UA_NHS), fp16 (UA_DTYPE), block tables from a file (UA_PATTERNS=99, UA_BLOCK_TABLE), simulated profiling
+  (UA_SIM_PROFILE), fusion disabled (UA_NO_FUSION), per-step planning time, cluster name 'local'.
+- orchestrated_attn/: flash-attn 2.7+ call signature; LSE-weighted merge of partial outputs in reduce();
+  optional per-kernel CUDA-event trace (UA_TRACE).
+- tests/distributed/device_communicators/pynccl*.py: integer peer ids for ctypes; tools/profile_kernel.py (added):
+  the flash-attn timing table the cost model reads.
+
+diff --git a/orchestrated_attn/online_softmax_merge.py b/orchestrated_attn/online_softmax_merge.py
+new file mode 100644
+index 0000000..9280c9a
+--- /dev/null
++++ b/orchestrated_attn/online_softmax_merge.py
+@@ -0,0 +1,52 @@
++"""LSE-weighted online-softmax merge for combining attention partials.
++
++Ported from long-context-attention (yunchang/ring/utils.py `_update_out_and_lse`),
++the numerically stable ring-attention merge. UltraAttn's runtime does not combine
++partials of one Q row from different KV shards (receives overwrite, reduce_scatter
++sums), which is correct only when a Q row's whole KV lives on one contributor;
++this module adds the LSE-weighted merge that combines them.
++
++Convention here (matches flash-attn's raw output):
++    O   : [b, S, H, D]  fp32 accumulator
++    lse : [b, H, S]     fp32   (natural log of the softmax denominator)
++Both `out`/`lse` and the block being merged in use this layout; `lse` is carried
++internally as [b, S, H, 1] to broadcast against O.
++"""
++import torch
++import torch.nn.functional as F
++
++
++def _to_internal_lse(lse_bhs):
++    # [b, H, S] -> [b, S, H, 1]
++    return lse_bhs.transpose(-2, -1).unsqueeze(dim=-1).contiguous()
++
++
++def _from_internal_lse(lse_bshi):
++    # [b, S, H, 1] -> [b, H, S]
++    return lse_bshi.squeeze(-1).transpose(-2, -1).contiguous()
++
++
++def merge_(out, lse_bshi, block_out, block_lse_bhs):
++    """In-place online-softmax merge of one block into (out, lse_bshi).
++
++    out         : [b, S, H, D] fp32, the running accumulator (modified in place)
++    lse_bshi    : [b, S, H, 1] fp32, the running lse (modified in place)
++    block_out   : [b, S, H, D] the block to fold in (any float dtype)
++    block_lse_bhs: [b, H, S]   its lse
++
++    Returns (out, lse_bshi). Numerically stable form (identical to
++    long-context-attention): a sigmoid/logsigmoid rewrite of the log-sum-exp
++    update that never exponentiates a positive argument.
++    """
++    block_out = block_out.to(torch.float32)
++    block_lse = _to_internal_lse(block_lse_bhs).to(torch.float32)
++    out.sub_(torch.sigmoid(block_lse - lse_bshi) * (out - block_out))
++    lse_bshi.sub_(F.logsigmoid(lse_bshi - block_lse))
++    return out, lse_bshi
++
++
++def new_accumulator(block_out, block_lse_bhs):
++    """Seed an accumulator from the first block (fp32 copies)."""
++    out = block_out.to(torch.float32).clone()
++    lse = _to_internal_lse(block_lse_bhs).to(torch.float32).clone()
++    return out, lse
+diff --git a/orchestrated_attn/orchestrated_attn_impl.py b/orchestrated_attn/orchestrated_attn_impl.py
+index 65e4e57..b51002a 100644
+--- a/orchestrated_attn/orchestrated_attn_impl.py
++++ b/orchestrated_attn/orchestrated_attn_impl.py
+@@ -13,6 +13,60 @@ from .global_vars import *
+ from search_algo.dependent_graph import Cuda_Kernel, Comp_Kernel, Comm_Kernel
+ import copy
+ 
++# ---- per-kernel tracing (off unless UA_TRACE=1) ----------------------------
++# Each kernel is bracketed by a pair of CUDA events on its own stream, so what
++# comes out is when the kernel actually ran on the GPU, not when the host
++# enqueued it. The list is cleared at the top of every forward pass, so after
++# the benchmark it holds exactly the last iteration.
++UA_TRACE = bool(int(os.environ.get("UA_TRACE", "0")))
++_TRACE = []
++_EPOCH = [0]
++
++
++def trace_new_epoch():
++    """Called once per forward pass. Records carry the epoch they were made in,
++    so the dump can keep only the last iteration -- a plain reset would not work
++    at the inter level, where one inter compute kernel runs a whole intra plan
++    and would clear the records of the kernels around it."""
++    _EPOCH[0] += 1
++
++
++def trace_dump(path, rank, extra=None):
++    """Resolve the recorded events into ms relative to the first kernel start."""
++    import json
++    torch.cuda.synchronize()
++    if not _TRACE:
++        return
++    last = max(e for _, _, _, _, e in _TRACE)
++    keep = [t for t in _TRACE if t[4] == last]
++    if not keep:
++        return
++    base = keep[0][2]
++    recs = []
++    for key, kind, ev0, ev1, _e in keep:
++        try:
++            start = base.elapsed_time(ev0)
++            dur = ev0.elapsed_time(ev1)
++        except Exception:
++            continue
++        r = dict(kind="comm" if kind == "inter_comm" else kind,
++                 level="inter" if kind == "inter_comm" else "intra",
++                 start=start, dur=dur)
++        if kind == "comp":
++            r["rows"] = [int(x) for x in key[2]] if isinstance(key[2], tuple) else [int(key[2])]
++            r["cols"] = [int(x) for x in key[3]] if isinstance(key[3], tuple) else [int(key[3])]
++            r["fused"] = len(r["rows"]) * len(r["cols"]) > 1
++        else:
++            r.update(block=int(key[2]), src=int(key[3]), dst=int(key[4]),
++                     io=key[5], rc=key[6],
++                     role="send" if int(key[3]) == rank else "recv")
++        recs.append(r)
++    out = dict(rank=rank, kernels=recs)
++    if extra:
++        out.update(extra)
++    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
++    json.dump(out, open(path, "w"))
++
+ def execute_kernel_old(kernel: Cuda_Kernel, data_dict: dict, PROC_INFO, comp_func, comm: IntraComm, idata_buf: dict, causal):
+     rank = PROC_INFO['rank']
+     local_rank = PROC_INFO['local_rank']
+@@ -83,6 +137,9 @@ def execute_kernel(kernel: Cuda_Kernel, data_dict: dict, PROC_INFO, comp_func, c
+             # print_rank_0(f'')
+             # # [DEBUG]: End
+             # step2: execute kernel
++            if UA_TRACE:
++                _ev0 = torch.cuda.Event(enable_timing=True)
++                _ev0.record(kernel.stream)
+             # comp: (b_id, h_id, r_id, c_id, gpuid) -> Cuda_Kernel
+             # comm: (b_id, h_id, r/c_id, send, recv, i/o, r/c) -> Cuda_Kernel
+             if isinstance(kernel, Comp_Kernel):
+@@ -128,6 +185,12 @@ def execute_kernel(kernel: Cuda_Kernel, data_dict: dict, PROC_INFO, comp_func, c
+             # step3: record event after kernel execution for successors
+             kernel.event = torch.cuda.Event()
+             kernel.event.record(kernel.stream)
++            if UA_TRACE:
++                _ev1 = torch.cuda.Event(enable_timing=True)
++                _ev1.record(kernel.stream)
++                _TRACE.append((kernel.key,
++                               "comp" if isinstance(kernel, Comp_Kernel) else "comm",
++                               _ev0, _ev1, _EPOCH[0]))
+ 
+ def execute_inter_kernel(kernel: Cuda_Kernel, data_dict: dict, PROC_INFO, comp_func, comm: InterComm, buf_dict: dict, causal):
+     rank = PROC_INFO['rank']
+@@ -187,6 +250,14 @@ def execute_inter_kernel(kernel: Cuda_Kernel, data_dict: dict, PROC_INFO, comp_f
+                 #     else:
+                 #         data_dict[o_keys[t]] = out[t]
+             else:
++                # Inter-level comm DOES own a stream, so it can be bracketed the
++                # same way the intra kernels are. The inter *compute* kernel
++                # cannot: it has no stream of its own, it runs a whole intra plan
++                # across the node's streams, so its cost shows up as the intra
++                # kernels it launched.
++                if UA_TRACE:
++                    _iev0 = torch.cuda.Event(enable_timing=True)
++                    _iev0.record(kernel.stream)
+                 # d_key = kernel.key[: 3] + kernel.key[5:]
+                 buf_key = (kernel.key[-2:], 1)  # (('i'/'o', 'r'/'c'), 1)
+                 if kernel.key[3] == node_id: # Send
+@@ -198,6 +269,11 @@ def execute_inter_kernel(kernel: Cuda_Kernel, data_dict: dict, PROC_INFO, comp_f
+                     # else:
+                     #     data_dict[d_key] = idata_tmp
+             
++            if UA_TRACE and not isinstance(kernel, Comp_Kernel):
++                _iev1 = torch.cuda.Event(enable_timing=True)
++                _iev1.record(kernel.stream)
++                _TRACE.append((kernel.key, "inter_comm", _iev0, _iev1, _EPOCH[0]))
++
+             # step3: record event after kernel execution for successors
+             if hasattr(kernel, 'sub_streams'):  # Current is a comp kernel !!!
+                 assert isinstance(kernel, Comp_Kernel)
+@@ -212,6 +288,30 @@ def execute_inter_kernel(kernel: Cuda_Kernel, data_dict: dict, PROC_INFO, comp_f
+                 kernel.event = torch.cuda.Event()
+                 kernel.event.record(kernel.stream)
+                 
++# --- compatibility shim -------------------------------------------------------
++# UltraAttn was written against flash-attn 2.5.x (its `v2.5.7_burst` fork).  In
++# 2.7+ `_flash_attn_forward` lost the `out=` argument, split `window_size` into
++# two ints, gained `softcap`, and returns 4 values instead of 8.  These wrappers
++# keep the call sites below unchanged.
++def _fa_fwd(q, k, v, dropout_p, softmax_scale, causal=False, window_size=(-1, -1),
++            alibi_slopes=None, return_softmax=False, out=None):
++    o, lse, S_dmask, rng_state = _flash_attn_forward(
++        q, k, v, dropout_p, softmax_scale, causal,
++        window_size[0], window_size[1], 0.0, alibi_slopes, return_softmax)
++    if out is not None:
++        out.copy_(o)
++        o = out
++    return o, q, k, v, o, lse, S_dmask, rng_state
++
++
++def _fa_bwd(dout, q, k, v, o, lse, dq, dk, dv, dropout_p, softmax_scale, causal,
++            window_size, alibi_slopes, deterministic, rng_state=None, softmax_d=None):
++    return _flash_attn_backward(
++        dout, q, k, v, o, lse, dq, dk, dv, dropout_p, softmax_scale, causal,
++        window_size[0], window_size[1], 0.0, alibi_slopes, deterministic, rng_state)
++# ------------------------------------------------------------------------------
++
++
+ def stream_wait_event(stream: Union[torch.cuda.Stream, list], event: torch.cuda.Event):
+     if isinstance(stream, torch.cuda.Stream):
+         stream.wait_event(event)
+@@ -219,6 +319,24 @@ def stream_wait_event(stream: Union[torch.cuda.Stream, list], event: torch.cuda.
+         stream[0].wait_event(event)
+         stream[1].wait_event(event)
+         
++def _rescale_partials_by_lse(or_buf, lse, r_ncclcomm, X, Q_shape_row, stream):
++    """In place: scale each of the X partials in `or_buf` by exp(lse_i - LSE),
++    where LSE = logsumexp over the X 'r'-group members of their lse. `lse` is this
++    member's [1, Nh, X*Sq] (flash-attn layout); `or_buf` views as Q_shape_row =
++    [1, X*Sq, Nh, D]. After this, a plain SUM reduce_scatter is the exact merge."""
++    import torch as _t
++    with _t.cuda.stream(stream):
++        own = lse.contiguous()                       # [1, Nh, X*Sq] fp32
++        gathered = _t.empty(X * own.numel(), device=own.device, dtype=own.dtype)
++        r_ncclcomm.all_gather(own.reshape(-1), gathered, stream)
++        G = gathered.view(X, *own.shape)             # [X, 1, Nh, X*Sq]
++        m = G.amax(0)                                # [1, Nh, X*Sq]
++        LSE = m + _t.log(_t.exp(G - m).sum(0))       # [1, Nh, X*Sq]
++        w = _t.exp(own - LSE)                        # [1, Nh, X*Sq]
++        o = or_buf.view(Q_shape_row)                 # [1, X*Sq, Nh, D]
++        o.mul_(w.transpose(1, 2).unsqueeze(-1).to(o.dtype))
++
++
+ def fused_attn_forward(execution_plan: Fused_Execution_Plan, comm: Comm_Fused, streams: list, level_rank: int, fwd_comp_func):
+     X, Y = execution_plan.X, execution_plan.Y
+     cur_x_id = level_rank % X
+@@ -293,6 +411,15 @@ def fused_attn_forward(execution_plan: Fused_Execution_Plan, comm: Comm_Fused, s
+     else:
+         streams[2].wait_event(events[0])
+         streams[2].wait_event(events[2])
++    # LSE-weighted merge BEFORE the SUM reduce_scatter (2-step trick): the X
++    # per-column-shard partials in buf_dict['or'] are attention outputs over
++    # DIFFERENT KV shards, so a plain SUM is not exact. all_gather each shard's lse
++    # over the 'r' group, form the global per-row LSE, and rescale this rank's
++    # partial by exp(lse_i - LSE); then the existing SUM reduce_scatter is exact
++    # (O = sum_i exp(lse_i - LSE) O_i).
++    if os.environ.get('UA_MERGE', '1') == '1' and X > 1 and out_row_tot.lse is not None:
++        _rescale_partials_by_lse(buf_dict['or'], out_row_tot.lse, comm.r_ncclcomm,
++                                 X, Q_shape_row, streams[2])
+     comm.reduce_scatter('r', buf_dict['or'], out_row, streams[2])
+     # comm.all_gather('c', buf_dict['oc'], out_col, streams[2])
+     return out_row
+@@ -323,7 +450,7 @@ def intra_attn_forward(
+         # print_rank_0(f'shape Q: {inp_row.Q.shape}, K: {inp_col.K.shape}, V: {inp_col.V.shape}, O: {out_row.O.shape}')
+         # print(f'rank{local_rank}, dropout_p: {dropout_p}, softmax_scale: {softmax_scale}, , causal: {causal}, window_size: {window_size}, alibi_slopes: {alibi_slopes}, return_softmax: {True and dropout_p > 0}', flush=True)
+         # print_rank_0(f'inp_row.Q: {inp_row.Q.shape}, inp_col.K: {inp_col.K.shape}, inp_col.V: {inp_col.V.shape}')
+-        O, _, _, _, _, lse, _, _ = _flash_attn_forward(     # O: [mbs, S, Nh, D], lse: [mbs, Nh, S]
++        O, _, _, _, _, lse, _, _ = _fa_fwd(     # O: [mbs, S, Nh, D], lse: [mbs, Nh, S]
+             inp_row.Q,
+             inp_col.K,
+             inp_col.V,
+@@ -335,9 +462,11 @@ def intra_attn_forward(
+             return_softmax=True and dropout_p > 0,
+             out=out_row.O,
+         )
++        # Keep the lse on the output object so a downstream reduce() can do the
++        # online-softmax merge. `out_row.O` was written in place by flash-attn;
++        # `lse` is [mbs, Nh, S], the layout Output_Row_Fwd.reduce expects.
++        out_row.lse = lse
+         return (out_row, out_col)
+-        lse = lse.transpose(-2, -1).contiguous().unsqueeze(dim=-1) # block_out, block_lse # [mbs, S, Nh, D], [mbs, S, Nh, 1]
+-        return (Output_Row_Fwd(O, lse), Output_Col_Fwd())
+     
+     unified_fwd_comp_func = partial(fwd_comp_func, causal=causal)
+     
+@@ -379,6 +508,8 @@ def orchestrated_attn_forward(
+ ) -> Output_Row_Fwd:
+     # [NOTE]: Now not support batch mechanism and only support tot_sp = world_size
+     # [NOTE]: Now only support bs_split == 1, Nh_split == 1
++    if UA_TRACE:
++        trace_new_epoch()
+     node_id = PROC_INFO['nodeid']
+     node_num = PROC_INFO['node_num']
+     inter_execution_plan: Execution_Plan = execution_plan_dict['inter']
+@@ -575,7 +706,7 @@ def intra_attn_backward(
+                       out_row: Output_Row_Bwd, out_col: Output_Col_Bwd, causal) -> tuple:
+         # print_rank_0(f'shape Q: {inp_row.Q.shape}, dO: {inp_row.dO.shape}, K: {inp_col.K.shape}, V: {inp_col.V.shape}, dQ: {out_row.dQ.shape}, dK: {out_col.dK.shape}')
+         # print(f'rank{local_rank}, dropout_p: {dropout_p}, softmax_scale: {softmax_scale}, , causal: {causal}, window_size: {window_size}, alibi_slopes: {alibi_slopes}, return_softmax: {True and dropout_p > 0}', flush=True)
+-        _flash_attn_backward(
++        _fa_bwd(
+             inp_row.dO,
+             inp_row.Q,
+             inp_col.K,
+@@ -635,6 +766,8 @@ def orchestrated_attn_backward(
+ ) -> tuple: # (Output_Row_Bwd, Output_Col_Bwd)
+         # [NOTE]: Now not support batch mechanism and only support tot_sp = world_size
+     # [NOTE]: Now only support bs_split == 1, Nh_split == 1
++    if UA_TRACE:
++        trace_new_epoch()
+     node_id = PROC_INFO['nodeid']
+     node_num = PROC_INFO['node_num']
+     inter_execution_plan: Execution_Plan = execution_plan_dict['inter']
+diff --git a/orchestrated_attn/utils.py b/orchestrated_attn/utils.py
+index b9adf42..0eed658 100644
+--- a/orchestrated_attn/utils.py
++++ b/orchestrated_attn/utils.py
+@@ -82,14 +82,13 @@ class Input_Col_Fwd(Integrated_Data):
+         return cls(K, V, data)
+ 
+ class Output_Row_Fwd(Integrated_Data):
+-    def __init__(self, O, lse: Optional[torch.Tensor] = None): # [mbs, Sq, Nh, D], [mbs, Sq, Nh, 1]
+-        # [NOTE]: simplify the data structure, not include lse !!!
+-        # self.data = torch.cat([O.flatten(), lse.flatten()], dim=0)
+-        # self.O = self.data[: O.numel()].view_as(O)
+-        # self.lse = self.data[O.numel() :].view_as(lse)
++    def __init__(self, O, lse: Optional[torch.Tensor] = None): # O:[mbs,Sq,Nh,D]  lse:[mbs,Nh,Sq]
++        # lse is kept: the online-softmax merge in reduce() needs it. It is
++        # carried as an attribute (not packed into `data`) so the existing buffer
++        # plumbing that treats `data` as the O bytes is unchanged.
+         self.data = O
+         self.O = self.data
+-        self.lse = None
++        self.lse = lse
+     
+     # @classmethod
+     # def from_execution_plan(cls, execution_plan: Execution_Plan, x: torch.Tensor):
+@@ -117,21 +116,19 @@ class Output_Row_Fwd(Integrated_Data):
+         
+         
+     def reduce(self, other):
+-        # def _update_out_and_lse(
+-        #     out: torch.Tensor,
+-        #     lse: torch.Tensor,
+-        #     block_out: torch.Tensor,
+-        #     block_lse: torch.Tensor,
+-        # ) -> Tuple[torch.Tensor, torch.Tensor]:
+-        #     new_lse = lse + torch.log(1 + torch.exp(block_lse - lse))
+-        #     out = torch.exp(lse - new_lse) * out + torch.exp(block_lse - new_lse) * block_out
+-        #     lse = new_lse
+-        #     return out, lse
+-        # [TODO]: complete here !!!
+-        # old_lse = self.lse
+-        # self.lse = self.lse + torch.log(1 + torch.exp(other.lse - self.lse))    # inplace ?
+-        # self.O = torch.exp(old_lse - self.lse) * self.O + torch.exp(other.lse - self.lse) * other.O # inplace ?
+-        pass
++        # LSE-weighted online-softmax merge of `other` into self, in fp32, via the
++        # canonical numerically-stable primitive (ported from
++        # long-context-attention). Requires both carry lse; if either is missing
++        # (a partial produced by a path that does not keep it) the merge is skipped
++        # and the upstream behaviour (no merge) is kept there.
++        from orchestrated_attn.online_softmax_merge import merge_, _to_internal_lse
++        if self.lse is None or other.lse is None:
++            return
++        acc = self.O.to(torch.float32)
++        acc_lse = _to_internal_lse(self.lse).to(torch.float32)
++        merge_(acc, acc_lse, other.O, other.lse)
++        self.O.copy_(acc.to(self.O.dtype))
++        self.lse = acc_lse.squeeze(-1).transpose(-2, -1).contiguous()
+         
+ 
+ class Output_Col_Fwd(Integrated_Data):
+diff --git a/search_algo/bsa_utils.py b/search_algo/bsa_utils.py
+index be297fa..d7d341f 100644
+--- a/search_algo/bsa_utils.py
++++ b/search_algo/bsa_utils.py
+@@ -1,3 +1,4 @@
++import os
+ import numpy as np
+ import inspect
+ from search_algo.utils import unique_list, Block_Comp_Volume
+@@ -19,9 +20,18 @@ def select_best_profile_comp_key(key_preffix, profile_comp_key_suffixes, comp_pr
+             if not fault_tolerance_func(key_suffix):
+                 # When Nh=32 and intra_bsa=full and inter_bsa is dense, 'w_kernel_tile' does not exist !!!
+                 raise e
++            # A tolerated miss means this suffix has no cost and is therefore not
++            # a candidate; skipping it keeps `cur_comp_time` from carrying the
++            # previous candidate's time, which would re-select the
++            # last priced key.
++            continue
+         if cur_comp_time < opt_comp_time:
+             selected_key_suffix = key_suffix
+             opt_comp_time = cur_comp_time
++    if opt_comp_time == float('inf'):
++        raise KeyError(
++            f"no profiled cost for any suffix of {key_preffix!r}: "
++            f"{list(profile_comp_key_suffixes)}")
+     return f'{key_preffix}{selected_key_suffix}'
+     
+ def convert_intra_profile_key_to_exe_key_or_plan(comp_map_key, prof_db: Prof_DB):
+@@ -113,6 +123,14 @@ def split_to_node_configs(global_bsa_config: BSA_Config) -> List[BSA_Config]:
+     return node_bsa_configs
+         
+ def create_bsa_block_table(case_id: int) -> np.ndarray:
++    if case_id == 99:
++        # a block table from a file: UA_BLOCK_TABLE = .npy of ints 0/1/2
++        # (EMPTY/FULL/CAUSAL), square: the original UltraAttn pipeline on an arbitrary mask.
++        raw = np.load(os.environ["UA_BLOCK_TABLE"])
++        assert raw.ndim == 2 and raw.shape[0] == raw.shape[1], raw.shape
++        conv = {0: Block_Type.EMPTY, 1: Block_Type.FULL, 2: Block_Type.CAUSAL}
++        block_table = np.vectorize(lambda x: conv[int(x)], otypes=[object])(raw).astype(Block_Type)
++        return block_table
+     if case_id == 0:
+         # stride(1/16, 4, 3) (after remapping)
+         block_table = np.full((16, 16), fill_value=Block_Type.EMPTY, dtype=Block_Type)
+@@ -141,6 +159,52 @@ def create_bsa_block_table(case_id: int) -> np.ndarray:
+                 block_table[i, j] = Block_Type.FULL
+             block_table[i, 0] = Block_Type.FULL
+             block_table[i, i] = Block_Type.CAUSAL
++    elif case_id in (6, 7):
++        # Multi-level shared prefix (prefix caching / beam search): every node of
++        # a prefix tree owns a contiguous run of blocks laid out in DFS order, so
++        # its queries see all ancestor blocks in full plus its own causally.
++        # Three-level prefix tree.  A *uniform* two-level tree (one root plus
++        # equal siblings) reduces to an existing pattern -- BSA_Repr.simplify()
++        # folds it back into star(1/4).  Depth 3 is what star cannot express:
++        #   root      blocks 0-3        (shared system prompt)
++        #   branch A  blocks 4-7        + grandchild A0 blocks 8-9
++        #   branch B  blocks 10-13      + grandchild B0 blocks 14-15
++        # Node sizes stay powers of two so the tiler only ever asks for Q/KV
++        # length ratios of 1/1, 1/2 and 2/1.
++        rows_16 = [
++            "C...............", "FC..............", "FFC.............", "FFFC............",
++            "FFFFC...........", "FFFFFC..........", "FFFFFFC.........", "FFFFFFFC........",
++            "FFFFFFFFC.......", "FFFFFFFFFC......",
++            "FFFF......C.....", "FFFF......FC....", "FFFF......FFC...", "FFFF......FFFC..",
++            "FFFF......FFFFC.", "FFFF......FFFFFC",
++        ]
++        rows_8 = ["C.......", "FC......", "FFC.....", "FFFC....",
++                  "FF..C...", "FF..FC..", "FF......".replace("....", "..C.")[:8],
++                  "FF..FFFC"]
++        rows = rows_16 if case_id == 6 else rows_8
++        n = len(rows)
++        block_table = np.full((n, n), fill_value=Block_Type.EMPTY, dtype=Block_Type)
++        for i, row in enumerate(rows):
++            for j, c in enumerate(row):
++                if c == "F":
++                    block_table[i, j] = Block_Type.FULL
++                elif c == "C":
++                    block_table[i, j] = Block_Type.CAUSAL
++    elif case_id == 8:
++        # Same three-level prefix tree as case 6, but with a context remap applied
++        # (UltraAttn Sec 5.1): rows and columns are permuted by the same permutation,
++        # which is only a relabelling of chunks, chosen so that a sequential split
++        # across nodes is balanced.  Without it, chunk work grows down the rows
++        # (0.5, 1.5, ... 9.5) and cutting the table in half gives 32 vs 60 units.
++        base = create_bsa_block_table(6)
++        w = np.vectorize(lambda x: {Block_Type.EMPTY: 0.0, Block_Type.FULL: 1.0,
++                                    Block_Type.CAUSAL: 0.5}[x])(base).sum(axis=1)
++        groups, load = [[], []], [0.0, 0.0]
++        for i in np.argsort(-w):                      # longest processing time first
++            g = int(np.argmin(load))
++            groups[g].append(int(i)); load[g] += w[i]
++        perm = np.array(sorted(groups[0]) + sorted(groups[1]))
++        block_table = base[np.ix_(perm, perm)]
+     elif case_id == 4:  # Full
+         block_table = np.full((1, 1), fill_value=Block_Type.FULL, dtype=Block_Type)
+     elif case_id == 5:  # Causal
+diff --git a/search_algo/dcp_adapter.py b/search_algo/dcp_adapter.py
+new file mode 100644
+index 0000000..bd7682e
+--- /dev/null
++++ b/search_algo/dcp_adapter.py
+@@ -0,0 +1,90 @@
++"""Bring an externally computed block assignment into UltraAttn's own planning pipeline.
++
++The block problem and the assignment containers are those of the Dex release (baselines/ua/deploy.py; the release
++root must be on PYTHONPATH). Mapping (with UA_FAITHFUL=1, partial blocks are priced by live / nominal work
++through dependent_graph.LIVE_SCALE):
++  BlockProblem                         UltraAttn
++  ---------------------------------------------------------------
++  weight 0    (dead)                   Block_Type.EMPTY    (vol 0)
++  weight exactly 0.5                   Block_Type.CAUSAL   (vol 0.5)
++  any other weight                     Block_Type.FULL     (vol 1)
++  asg.owner[b]  block -> device        cmap[b] / S_map[0, b]
++  asg.dev[q, k] tile  -> device        schedule_table[0, 0, q, k]
++"""
++from __future__ import annotations
++
++import json
++import os
++import sys
++
++import numpy as np
++
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
++
++from search_algo.utils import Block_Type                      # noqa: E402
++from search_algo.bsa_config import BSA_Repr, BSA_Config       # noqa: E402
++from search_algo.global_vars import TASK_STATUS               # noqa: E402
++
++
++def problem_to_block_table(prob) -> np.ndarray:
++    """BlockProblem weights -> UltraAttn Block_Type table (ParD x ParD)."""
++    w = prob.weights()
++    n = prob.n_blocks
++    bt = np.empty((n, n), dtype=Block_Type)
++    for i in range(n):
++        for j in range(n):
++            x = float(w[i, j])
++            bt[i, j] = (Block_Type.EMPTY if x == 0
++                        else Block_Type.CAUSAL if abs(x - 0.5) < 1e-9
++                        else Block_Type.FULL)
++    return bt
++
++
++def build_bsa_config(prob, owner: np.ndarray, CP_intra: int, CP_inter: int = 1) -> BSA_Config:
++    """Wrap the problem's mask as a BSA_Config. cmap stays None, as in UltraAttn's own pipeline (task1_bsa.py);
++    ownership rides in S_map / schedule_table, which is what Dist_Attn_Schedule reads."""
++    bt = problem_to_block_table(prob)
++    repr_ = BSA_Repr(bt, cmap=None)
++    return BSA_Config(pat_bsa_repr={"bsa_repr": repr_, "CP": (CP_intra, CP_inter)})
++
++
++def assignment_to_schedule_table(prob, dev: np.ndarray, split_Nh: int = 1,
++                                 split_bs: int = 1) -> np.ndarray:
++    """tile -> device map as UltraAttn's (bs, Nh, Sq, Skv) schedule_table; masked tiles carry TASK_STATUS.EMPTY."""
++    w = prob.weights()
++    n = prob.n_blocks
++    table = np.empty((split_bs, split_Nh, n, n), dtype=np.int32)
++    table.fill(TASK_STATUS.EMPTY.value)
++    for i in range(n):
++        for j in range(n):
++            if float(w[i, j]) > 0:
++                table[:, :, i, j] = int(dev[i, j])
++    return table
++
++
++def plan_from_problem(problem_json: str, strategy: str, CP_intra: int, CP_inter: int = 1,
++                      assignment_file: str = None):
++    """Load a problem and its assignment (a file {dev, owner}, or a fresh run of `strategy`); return everything
++    UltraAttn needs: (prob, asg, bsa_config, schedule_table, S_map)."""
++    from baselines.ua.deploy import STRATEGIES, Assignment, BlockProblem, Topo
++
++    prob = BlockProblem.from_json(open(problem_json).read())
++    topo = Topo(n_nodes=CP_inter, gpus_per_node=CP_intra)
++    # Per-block byte costs default to MHA (Q 1 : K+V 2 : partial O 1); PG_BYTES="q,kv,o" sets the real sizes.
++    if os.environ.get("PG_BYTES"):
++        topo.q_bytes, topo.kv_bytes, topo.o_bytes = (float(x) for x in os.environ["PG_BYTES"].split(","))
++        print(f"[adapter] block byte costs q={topo.q_bytes} kv={topo.kv_bytes} o={topo.o_bytes}", flush=True)
++    if assignment_file:
++        blob = json.load(open(assignment_file))
++        asg = Assignment(strategy, np.asarray(blob["dev"], dtype=np.int64), np.asarray(blob["owner"], dtype=np.int64))
++        print(f"[adapter] explicit assignment {os.path.basename(assignment_file)}", flush=True)
++    else:
++        import time as _time
++        _t0 = _time.perf_counter()
++        asg = STRATEGIES[strategy](prob, topo)
++        print(f"[phase] n_blocks={prob.n_blocks} stage=deployment strategy={strategy} "
++              f"world={CP_intra * CP_inter} seconds={_time.perf_counter() - _t0:.4f}", flush=True)
++    bsa_config = build_bsa_config(prob, asg.owner, CP_intra, CP_inter)
++    schedule_table = assignment_to_schedule_table(prob, asg.dev)
++    S_map = np.asarray(asg.owner, dtype=np.int32).reshape(1, prob.n_blocks)
++    return prob, asg, bsa_config, schedule_table, S_map
+diff --git a/search_algo/dcp_in_ultraattn.py b/search_algo/dcp_in_ultraattn.py
+new file mode 100644
+index 0000000..a9022be
+--- /dev/null
++++ b/search_algo/dcp_in_ultraattn.py
+@@ -0,0 +1,518 @@
++"""Build UltraAttn execution plans from a given block assignment.
++
++Mirrors `generate_intra_bsa_execution_plans` in task1_bsa.py, but replaces
++UltraAttn's own `cc_optimal_schedule` with a schedule table produced by an
++external assignment.  Everything downstream -- Dependent_Graph, the kernel
++tiling in Graph_Transformation_Engine, the scheduling ILP -- is UltraAttn's own
++code, so the planners are compared under identical execution machinery.
++
++Note the kernel-tile gate: `bsa_is_dense` restricts kernel tiling on the INTER
++node path only (task1_bsa.py:534).  The intra-node path has no such gate, so
++sparse patterns do get tiled here.
++
++    torchrun --nproc_per_node 4 search_algo/dcp_in_ultraattn.py \
++        --problem <problem.json> \
++        --strategy ultraattn --cp 4 --block-tokens 512 --heads 8
++"""
++from __future__ import annotations
++
++import argparse
++import time
++import os
++import sys
++
++import numpy as np
++import torch
++
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
++
++from search_algo.initialize import initialize_distribution, initialize_prof_db
++from search_algo.search_engine import (Dist_Attn_Config, Dist_Attn_Schedule,
++                                       Evaluation_Configs)
++from search_algo.dependent_graph import Dependent_Graph
++from search_algo.execute_plan import Execution_Plan
++from search_algo.graph_transformation_engine import Graph_Transformation_Engine
++from search_algo.global_vars import set_global_var
++from search_algo.dcp_adapter import plan_from_problem
++from search_algo.benchmark import benchmark_orchestrate_bsa
++from search_algo.utils import parse_args as ua_parse_args
++from orchestrated_attn.orchestrated_attn_impl import orchestrated_attn_func
++from search_algo.global_vars import get_global_var
++from functools import partial
++
++
++# The five ablation keys UltraAttn's own profiler expects for one da_config.
++ABLATIONS = [("w/o_gpu_tile", "w/o_kernel_tile", "Flexflow")] + [
++    (None, kt, ks) for ks in ("Flexflow", "ILP")
++    for kt in ("w/o_kernel_tile", "w_kernel_tile")]
++
++
++def ablation_key(da_config, fob, gpu_tile, kernel_tile, kernel_sched):
++    pre = (f"fob={fob}_CP={da_config.bsa_config.CP}"
++           f"_shape_config={{{da_config.get_shape_config_str()}}}"
++           f"_bsa_config={{{da_config.bsa_config}}}")
++    suf = (f"_ablation=({gpu_tile},{kernel_tile},{kernel_sched})" if gpu_tile
++           else f"_ablation=({kernel_tile},{kernel_sched})")
++    return pre + suf
++
++
++INTERPOLATED = {}
++
++
++FAITHFUL = os.environ.get("UA_FAITHFUL") == "1"
++
++
++def install_profile_interpolation():
++    """Let the cost model price a fused shape that was never profiled.
++
++    Their kernel profile is measured on S = powers of two (256..65536) for every
++    Q/KV block ratio p/q, p,q in 1..8.  Fusing three 512-token blocks asks for
++    S=1536, which is off that grid, and the lookup is a hard dict access behind
++    an assert -- so plan construction dies rather than the plan being costed.
++
++    Two kinds of miss are priced here.
++
++    1. **Off-grid S, profiled ratio.**  Interpolate log-log in S among the
++       entries matching on (bs, Nh, D, ratio, causal); at a given ratio attention
++       time grows like S^2, so log-log is close to linear and 1536 sits between
++       two measured points.
++
++    2. **Unprofiled ratio.**  A greedy fusion on an irregular mask readily
++       produces a rectangle like 5/9, and p or q > 8 is outside everything they
++       measured, so there is no same-ratio series to interpolate along.  Their
++       code asserts, which kills the whole `w_kernel_tile` rung rather than
++       rejecting the one candidate.  Price it instead from FLOPs: at a given
++       (bs, Nh, D, causal) attention time is proportional to Sq*Skv, so scale
++       the nearest profiled entry by the FLOP ratio.  Sq and Skv are recoverable
++       from the key, which carries min(Sq, Skv) and the reduced ratio p/q.
++
++    Every miss is recorded and reported: these are ESTIMATED costs, and they
++    steer which plan the search picks.  They do not touch measured runtimes --
++    what a rung reports as `MEASURED` is always a real timed run.
++    """
++    from search_algo.search_engine import Comp_Profile_Map, Machine_Config
++    orig = Comp_Profile_Map.get_comp_time_from_map_key
++
++    def _sq_skv(map_key):
++        """(Sq, Skv) from a key (min(Sq,Skv), bs, Nh, D, 'p/q', causal)."""
++        lo, ratio = map_key[0], map_key[4]
++        if isinstance(ratio, str) and "/" in ratio:
++            p, q = (int(t) for t in ratio.split("/"))
++        else:
++            r = float(ratio)
++            p, q = (r, 1.0) if r >= 1 else (1.0, 1.0 / r)
++        return (lo * p / q, lo) if p >= q else (lo, lo * q / p)
++
++    # ---- robust FLOP-linear rate from TRUSTED entries -----------------------
++    # Attention compute is linear in Sq*Skv (a fused r*c rectangle is r*c tiles),
++    # and the per-FLOP cost is taken as flat across ratio and S in the
++    # large-block regime. Two kinds of profile entry are not trusted for that
++    # rate, since they would misprice the large fused rectangles a sink-heavy
++    # mask needs:
++    #   * augmented fused-ratio entries (e.g. 7/2), and
++    #   * small-S entries (min(Sq,Skv) < S_TRUST); the smallest ones
++    #     (S <= 2048) are dominated by kernel launch cost.
++    # Both are left out of the rate fit.
++    # Calibrate one per-FLOP rate per (bs,Nh,D,causal) from the TRUSTED base grid
++    # (ratio p/1 or 1/q, min(Sq,Skv)>=S_TRUST) and price every comp kernel off it.
++    # Keep an exact profiled value only when it AGREES with that rate (<=DEVx);
++    # otherwise the linear estimate is used.
++    S_TRUST = 8192
++    DEV = 1.5
++    _rate = {}
++
++    def _robust_rate(pm, sig):
++        if sig in _rate:
++            return _rate[sig]
++        fs, bs_ = [], []
++        for k, v in pm.items():
++            if (k[1], k[2], k[3], k[5]) != sig:
++                continue
++            ratio = k[4]
++            if isinstance(ratio, str) and "/" in ratio:
++                p, q = (int(t) for t in ratio.split("/"))
++                if p != 1 and q != 1:            # trust only the base grid p/1, 1/q
++                    continue
++            a, b = _sq_skv(k)
++            if min(a, b) < S_TRUST or a * b <= 0:
++                continue
++            va = np.asarray(v, dtype=float)
++            fs.append(va[0] / (a * b)); bs_.append(va[1] / (a * b))
++        r = (float(np.median(fs)), float(np.median(bs_))) if fs else None
++        _rate[sig] = r
++        return r
++
++    def _linear(pm, map_key):
++        r = _robust_rate(pm, (map_key[1], map_key[2], map_key[3], map_key[5]))
++        if r is None:
++            return None
++        sq, skv = _sq_skv(map_key)
++        return np.array([r[0] * sq * skv, r[1] * sq * skv])
++
++    def _nearest_entry(self, map_key, pm):
++        same = sorted((k[0], np.asarray(v, dtype=float))
++                      for k, v in pm.items() if tuple(k[1:]) == tuple(map_key[1:]))
++        if len(same) < 2:
++            try:
++                sq, skv = _sq_skv(map_key); want = sq * skv
++                cands = []
++                for k, v in pm.items():
++                    if (k[1], k[2], k[3], k[5]) != (map_key[1], map_key[2],
++                                                    map_key[3], map_key[5]):
++                        continue
++                    a, b = _sq_skv(k)
++                    if a * b > 0:
++                        cands.append((abs(np.log(a * b / want)), a * b,
++                                      np.asarray(v, dtype=float)))
++                if not cands:
++                    return orig(self, map_key)
++                _, flops, val = min(cands, key=lambda t: t[0])
++                out = val * (want / flops)
++                INTERPOLATED[tuple(map_key)] = out.tolist()
++                return out
++            except Exception:
++                return orig(self, map_key)
++        xs = np.log(np.array([s for s, _ in same], dtype=float))
++        ys = np.log(np.stack([v for _, v in same]))
++        x = float(np.log(map_key[0]))
++        out = np.exp(np.array([np.interp(x, xs, ys[:, j])
++                               for j in range(ys.shape[1])]))
++        INTERPOLATED[tuple(map_key)] = out.tolist()
++        return out
++
++    def patched(self, map_key):
++        pm = getattr(self, "profile_map", {})
++        if FAITHFUL:
++            # UA_FAITHFUL: the executor's own measured profile is the cost (UltraAttn App. B.1.2): exact entry if
++            # profiled, else log-log in S along the same ratio, else FLOP-scaled nearest entry. No replacement.
++            if map_key in pm:
++                return np.asarray(orig(self, map_key), dtype=float)
++            return _nearest_entry(self, map_key, pm)
++        lin = _linear(pm, map_key)
++        if map_key in pm:
++            v = np.asarray(orig(self, map_key), dtype=float)
++            if lin is not None and lin[0] > 0 and not (1.0 / DEV <= v[0] / lin[0] <= DEV):
++                INTERPOLATED[tuple(map_key)] = lin.tolist()     # profiled entry off the linear rate
++                return lin
++            return v
++        if lin is not None:                                      # unprofiled fused shape
++            INTERPOLATED[tuple(map_key)] = lin.tolist()
++            return lin
++        return _nearest_entry(self, map_key, pm)                  # nearest profiled entry
++
++    if os.environ.get("COST_DEBUG"):
++        _p2 = patched
++        _logf = open(os.environ["COST_DEBUG"], "a")
++        def patched(self, map_key):          # noqa: F811
++            r = _p2(self, map_key)
++            try:
++                ms = float(np.asarray(r).ravel()[0]) * 1e3
++                hit = "PROF" if map_key in getattr(self, "profile_map", {}) else "FALL"
++                _logf.write(f"{ms:10.3f}ms  {hit:8s}  {tuple(map_key)}\n"); _logf.flush()
++            except Exception:
++                pass
++            return r
++    Comp_Profile_Map.get_comp_time_from_map_key = patched
++
++    # The ratio whitelist sits in get_comp_map_key, which runs BEFORE the
++    # lookup above, so an unprofiled ratio would abort the rung before the
++    # lookup ever saw the key.  Rebuild the key without that one assert (the
++    # GQA assert is kept -- that one is a real unsupported case, not a gap in
++    # the profile data).
++    import math as _math
++    from search_algo.search_engine import FlashAttn_Profile_Map
++
++    def key_no_ratio_assert(self, da_config, batch_degrees, split_degrees,
++                            causal=False):
++        assert len(batch_degrees) == 2 and len(split_degrees) == 4
++        sq = da_config.S[0] * batch_degrees[0] // split_degrees[0]
++        skv = da_config.S[1] * batch_degrees[1] // split_degrees[1]
++        bs = da_config.bs // split_degrees[2]
++        nh = da_config.Nh[0] // split_degrees[3]
++        g = _math.gcd(sq, skv)
++        if not FAITHFUL:
++            assert da_config.Nh[0] == da_config.Nh[1], \
++                f"GQA unsupported: Nh={da_config.Nh[0]}, Ng={da_config.Nh[1]}"
++        # GQA (UA_FAITHFUL): the key keeps Nh = query heads; the profile DB is per model (measured with that
++        # model's K/V heads, tools/profile_kernel.py --nkv), so the entry already prices the GQA kernel.
++        return (min(sq, skv), bs, nh, da_config.D, f"{sq // g}/{skv // g}", causal)
++
++    for _cls in (Comp_Profile_Map, FlashAttn_Profile_Map, Machine_Config):
++        if hasattr(_cls, "get_comp_map_key"):
++            _cls.get_comp_map_key = key_no_ratio_assert
++
++
++def build_plans(prob, bsa_config, schedule_table, S_map, prof_db, args):  # noqa: C901
++    n = prob.n_blocks
++    shape_config = {
++        "S": (n * args.block_tokens, n * args.block_tokens),
++        "Nh": (args.heads, getattr(args, "kv_heads", 0) or args.heads),    # (Q heads, K/V heads)
++        "bs": 1,
++        "D": 128,
++    }
++    da_config = Dist_Attn_Config.from_bsa_config(bsa_config, shape_config, hierarchy=1)
++    split_degrees = [n, n, 1, 1]                     # Sq, Skv, bs, Nh
++    if FAITHFUL:
++        import search_algo.dependent_graph as _dg
++        w = np.asarray(prob.weights(), dtype=float)
++        nom = np.where(w == 0, 0.0, np.where(np.abs(w - 0.5) < 1e-9, 0.5, 1.0))   # what the block table prices
++        _dg.LIVE_SCALE = (w, nom)
++    _t0 = time.perf_counter()
++    schedule = Dist_Attn_Schedule(da_config, prof_db.m_config, split_degrees,
++                                  S_map, schedule_table, hierarchy=1)
++    print(f"[phase] n_blocks={n} bt={args.block_tokens} stage=schedule_table "
++          f"seconds={time.perf_counter() - _t0:.4f}", flush=True)
++    out, failed = {}, {}
++    ladder = [a for a in ABLATIONS
++              if args.sched_rungs == "all" or a[2] == "Flexflow"]
++    for gpu_tile, kernel_tile, kernel_sched in ladder:
++        # transform_mode: their own 'greedy' (largest-first, one pass over the
++        # non-conflicting transformations, ONE plan evaluated) rather than 'bf'.
++        # 'bf' enumerates every SUBSET of the candidate fusions and builds a full
++        # Execution_Plan at each leaf; on a regular star/stream pattern trans_all
++        # is tiny and that is fine, but on an irregular mask it explodes -- an
++    # 8-block longformer mask produces over 10^5 leaves, and
++    # 32 blocks exceed the recursion limit.
++        exp_config = Evaluation_Configs(plan_type=kernel_sched, MAX_QUEUE_SIZE=0,
++                                        fob=getattr(args, "fob", 0), hierarchy=1,
++                                        transform_mode=args.transform_mode)
++        _t = time.perf_counter()
++        d_graph = Dependent_Graph(schedule, exp_config.fob)
++        print(f"[phase] n_blocks={n} bt={args.block_tokens} stage=dep_graph "
++              f"rung={kernel_tile}/{kernel_sched} "
++              f"seconds={time.perf_counter() - _t:.4f}", flush=True)
++        _t = time.perf_counter()
++        try:
++            if kernel_tile == "w_kernel_tile":
++                # Graph_Transformation_Engine.dfs_trans enumerates every SUBSET of
++                # the candidate fusions and builds a full Execution_Plan (ILP and
++                # all) at each leaf.  That is fine at the Par_D=8 their own
++                # experiments use and intractable past ~16: the recursion depth is
++                # the number of candidate transformations and the leaf count is
++                # exponential in it.  Record the rung as unavailable rather than
++                # stopping the whole run.
++                gt = Graph_Transformation_Engine(exp_config, da_config, prof_db.m_config)
++                plan = gt.transform(d_graph, exp_config.transform_mode,
++                                    plan_type=kernel_sched)
++            else:
++                plan = Execution_Plan(d_graph, exp_config.fob, plan_type=kernel_sched)
++        except RecursionError as e:
++            failed[(gpu_tile, kernel_tile, kernel_sched)] = f"RecursionError ({e})"
++            print(f"[phase] n_blocks={n} bt={args.block_tokens} "
++                  f"stage={'fusion' if kernel_tile == 'w_kernel_tile' else 'schedule'} "
++                  f"rung={kernel_tile}/{kernel_sched} "
++                  f"seconds={time.perf_counter() - _t:.4f} status=RecursionError",
++                  flush=True)
++            continue
++        except Exception as e:                      # noqa: BLE001 - report, continue
++            failed[(gpu_tile, kernel_tile, kernel_sched)] = f"{type(e).__name__}: {e}"
++            print(f"[phase] n_blocks={n} bt={args.block_tokens} "
++                  f"stage={'fusion' if kernel_tile == 'w_kernel_tile' else 'schedule'} "
++                  f"rung={kernel_tile}/{kernel_sched} "
++                  f"seconds={time.perf_counter() - _t:.4f} "
++                  f"status={type(e).__name__}", flush=True)
++            continue
++        # For w_kernel_tile the scheduling is done INSIDE the transformation
++        # search (a full Execution_Plan is built at every leaf), so this one
++        # number covers fusion+schedule and is not comparable to the pure
++        # schedule timing of the rung above it.
++        print(f"[phase] n_blocks={n} bt={args.block_tokens} "
++              f"stage={'fusion' if kernel_tile == 'w_kernel_tile' else 'schedule'} "
++              f"rung={kernel_tile}/{kernel_sched} "
++              f"seconds={time.perf_counter() - _t:.4f} status=ok", flush=True)
++        out[(gpu_tile, kernel_tile, kernel_sched)] = plan
++    return da_config, schedule, out, failed
++
++
++def register_plans(plans, da_config, prof_db, fob=0):
++    """Write the plans into UltraAttn's own plan store so that its profiler
++    (`profile_all_intra_BSA`) picks them up by key, exactly as it would its own."""
++    import json as _json
++    import pickle
++    kv_path = prof_db.INTRA_BSA_EXE_PLANS_KV
++    kv = _json.load(open(kv_path)) if os.path.exists(kv_path) else {}
++    os.makedirs(prof_db.INTRA_BSA_EXE_PLANS_DIR, exist_ok=True)
++    keys = []
++    for (gpu_tile, kernel_tile, kernel_sched), plan in plans.items():
++        key = ablation_key(da_config, fob, gpu_tile, kernel_tile, kernel_sched)
++        keys.append(key)
++        if key in kv:
++            plan_id = kv[key]
++        else:
++            plan_id = (max(kv.values()) + 1) if kv else 0
++            kv[key] = plan_id
++        with open(f"{prof_db.INTRA_BSA_EXE_PLANS_DIR}/{plan_id}.pkl", "wb") as f:
++            pickle.dump(plan, f)
++    with open(kv_path, "w") as f:
++        _json.dump(kv, f)
++    return keys
++
++
++
++def measure_plans(plans, da_config, exp_config, gloo_group, ncclcomm_global,
++                  warmup=4, iters=4):
++    """Run each plan on the GPUs through UltraAttn's own benchmark harness.
++
++    `profile_all_intra_BSA` insists the plan store holds all five ablation keys
++    before it will measure anything; we call the benchmark it wraps directly, so
++    whichever rungs built can be measured.  The dummy one-node inter plan and the
++    `inter_comp_plans_dict` shape are copied from that function.
++    """
++    PROC_INFO = get_global_var("PROC_INFO")
++    node_id = PROC_INFO["nodeid"]
++    S_per_gpu = max(da_config.S_per_gpu)
++    Nh = max(da_config.shape_config["Nh"])
++    D = da_config.shape_config["D"]
++    bs = da_config.shape_config["bs"]
++    buf_elems = (bs * S_per_gpu * Nh * D * 4) * 3 + (bs * S_per_gpu * Nh * D * 3 + 9) * 4
++    tensor_buf = torch.empty(int(buf_elems), device=torch.cuda.current_device(),
++                             dtype=torch.bfloat16, requires_grad=False)
++
++    names, inter_plans, comp_dicts = [], [], []
++    for name, plan in plans.items():
++        dummy = Execution_Plan.create_one_node_exe_plan(exp_config.fob)
++        d = {((1, 1), str(da_config.bsa_config.bsa_repr)): plan}
++        dummy.gpu_kernel_lists[node_id][0].execution_plan = plan
++        names.append(name); inter_plans.append(dummy); comp_dicts.append(d)
++
++    # Their parse_args() reads sys.argv and rejects anything it does not define,
++    # so hide our flags from it and take its defaults.
++    _argv = sys.argv
++    try:
++        sys.argv = [_argv[0]]
++        ua_args = ua_parse_args()
++    finally:
++        sys.argv = _argv
++    bench = partial(benchmark_orchestrate_bsa, ua_args, orchestrated_attn_func,
++                    da_config, exp_config, tensor_buf,
++                    inter_bsa_execution_plans=inter_plans,
++                    inter_comp_plans_dicts=comp_dicts,
++                    global_group=gloo_group, ncclcomm_global=ncclcomm_global,
++                    warmup=warmup, num_iter=iters, log=True)
++    results = bench(use_cudagraph=False)
++    del tensor_buf
++    torch.cuda.empty_cache()
++    return list(zip(names, results))
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--problem", required=True)
++    ap.add_argument("--strategy", default="dcp")
++    ap.add_argument("--cp", type=int, default=4)
++    ap.add_argument("--block-tokens", type=int, default=512)
++    ap.add_argument("--heads", type=int, default=8)
++    ap.add_argument("--sched-rungs", default="flexflow",
++                    choices=["flexflow", "all"],
++                    help="'all' includes the ILP-scheduled rungs. That model is "
++                         "quadratic in kernel count (one binary per pair of "
++                         "kernels sharing a stream), so on the assignments that "
++                         "emit the most kernels it does not finish -- 41 min and "
++                         "counting on shared_prefix/ultraattn -- while the "
++                         "measured ILP-vs-Flexflow effect is 1.000-1.002x.")
++    ap.add_argument("--warmup", type=int, default=4)
++    ap.add_argument("--iters", type=int, default=4)
++    ap.add_argument("--transform-mode", default="greedy",
++                    choices=["greedy", "bf", "none"],
++                    help="kernel-tiling search. greedy is linear; bf is their "
++                         "exhaustive subset search and is intractable on "
++                         "irregular masks.")
++    ap.add_argument("--assignment", default=None,
++                    help="JSON with dev/owner to use instead of running the "
++                         "planner (node sub-problems of the 2-node hierarchy)")
++    ap.add_argument("--measure", action="store_true",
++                    help="run the built plans on the GPUs through UltraAttn's own "
++                         "benchmark harness and report wall clock, not prediction")
++    ap.add_argument("--register", action="store_true",
++                    help="write the plans into UltraAttn's plan store so its own "
++                         "profiler can measure them")
++    args = ap.parse_args()
++    set_global_var("ARGS", args)
++
++    install_profile_interpolation()
++    ncclcomm_global, gloo_group = initialize_distribution()
++    prof_db = initialize_prof_db(gloo_group)
++    rank = torch.distributed.get_rank()
++
++    prob, asg, bsa_config, table, S_map = plan_from_problem(
++        args.problem, args.strategy, args.cp,
++        assignment_file=args.assignment)
++
++    # A non-deterministic planner run independently per rank would hand
++    # each one a different assignment, so the ranks would build different plans
++    # and execute mismatched collectives.  Rank 0's assignment wins and is
++    # broadcast.
++    dev_t = torch.as_tensor(np.ascontiguousarray(asg.dev), dtype=torch.int64).cuda()
++    own_t = torch.as_tensor(np.ascontiguousarray(asg.owner), dtype=torch.int64).cuda()
++    torch.distributed.broadcast(dev_t, 0)
++    torch.distributed.broadcast(own_t, 0)
++    dev_np, own_np = dev_t.cpu().numpy(), own_t.cpu().numpy()
++    from search_algo.dcp_adapter import (assignment_to_schedule_table,
++                                         build_bsa_config)
++    asg.dev, asg.owner = dev_np, own_np
++    bsa_config = build_bsa_config(prob, own_np, args.cp, 1)
++    table = assignment_to_schedule_table(prob, dev_np)
++    S_map = np.asarray(own_np, dtype=np.int32).reshape(1, prob.n_blocks)
++
++    built = {}
++    if rank == 0:
++        print(f"[{args.strategy}] {os.path.basename(args.problem)} "
++              f"N={prob.n_blocks} CP={args.cp}", flush=True)
++        da_config, schedule, plans, failed = build_plans(prob, bsa_config, table,
++                                                         S_map, prof_db, args)
++        for name, plan in plans.items():
++            tag = ",".join(x for x in name if x)
++            print(f"  {tag:44s} end_time={plan.get_end_time():.3e}", flush=True)
++        for name, why in failed.items():
++            tag = ",".join(x for x in name if x)
++            print(f"  {tag:44s} UNAVAILABLE: {why[:200]}", flush=True)
++        if INTERPOLATED:
++            print(f"  [cost model] {len(INTERPOLATED)} fused shape(s) priced by "
++                  f"interpolation, not measured: "
++                  f"{sorted(k[0] for k in INTERPOLATED)[:8]}", flush=True)
++        if args.register:
++            keys = register_plans(plans, da_config, prof_db)
++            print(f"  registered {len(keys)} ablation keys into "
++                  f"{prof_db.INTRA_BSA_EXE_PLANS_KV}", flush=True)
++        built = plans
++    torch.distributed.barrier(gloo_group)
++
++    if args.measure:
++        # Every rank must build the same plans -- the harness executes them
++        # collectively.  Rank 0 already did; the others do it now.
++        if rank != 0:
++            da_config, schedule, built, _ = build_plans(prob, bsa_config, table,
++                                                        S_map, prof_db, args)
++        else:
++            da_config, schedule, _b, _f = build_plans(prob, bsa_config, table,
++                                                      S_map, prof_db, args)
++            built = _b
++        exp_config = Evaluation_Configs(plan_type="Flexflow", MAX_QUEUE_SIZE=0,
++                                        fob=0, hierarchy=1,
++                                        transform_mode=args.transform_mode)
++        torch.distributed.barrier(gloo_group)
++        res = measure_plans(built, da_config, exp_config, gloo_group,
++                            ncclcomm_global, warmup=args.warmup, iters=args.iters)
++        if rank == 0:
++            # Persist under the SAME ablation keys register_plans writes, because
++            # UltraAttn's inter level prices a node tile by looking its intra plan
++            # up in INTRA_BSA_EXE_PLANS_PROFILE (Inter_Comp_Profile_Map reads
++            # profile_map[key]['time']).  Without this the two-level path has no
++            # cost model for the sub-problems and cannot be built at all.
++            import json as _json
++            pf = prof_db.INTRA_BSA_EXE_PLANS_PROFILE
++            prof = _json.load(open(pf)) if os.path.exists(pf) else {}
++            for name, r in res:
++                tag = ",".join(x for x in name if x)
++                key = ablation_key(da_config, 0, *name)
++                prof[key] = {"hfu": r.get("hfu"), "time": r.get("time")}
++                print(f"  MEASURED {tag:44s} {r}", flush=True)
++            with open(pf, "w") as f:
++                _json.dump(prof, f)
++            print(f"  persisted {len(res)} measurements into {os.path.basename(pf)}",
++                  flush=True)
++    torch.distributed.barrier(gloo_group)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/search_algo/dependent_graph.py b/search_algo/dependent_graph.py
+index 20cf0c6..a8fa6f4 100644
+--- a/search_algo/dependent_graph.py
++++ b/search_algo/dependent_graph.py
+@@ -48,6 +48,11 @@ class Cuda_Kernel():
+         self.remove_successor(v)
+         v.remove_precursor(self)
+ 
++_FAITHFUL = os.environ.get("UA_FAITHFUL") == "1"
++_GPN = int(os.environ.get("UA_GPU_PER_NODE", "4"))
++LIVE_SCALE = None     # (live work, nominal work) per block, set by build_plans under UA_FAITHFUL
++
++
+ class Comp_Kernel(Cuda_Kernel):
+     def __init__(self, key: tuple, m_config: Machine_Config, comp_map_key: tuple, hierarchy: int, \
+                  time: Optional[np.array] = None, seqlen_variable_graph = False):
+@@ -67,6 +72,16 @@ class Comp_Kernel(Cuda_Kernel):
+                 self.time = m_config.comp_profile_maps[hierarchy].get_comp_time_from_map_key(comp_map_key) # [fwd/bwd];
+             else:
+                 self.time = time
++            if _FAITHFUL and LIVE_SCALE is not None:
++                # partial tiles of an irregular mask: the profile prices FULL / CAUSAL blocks, the kernel only
++                # computes the live pairs -> scale by live work / nominal work of the kernel's blocks
++                rs = key[2] if isinstance(key[2], tuple) else (key[2],)
++                cs = key[3] if isinstance(key[3], tuple) else (key[3],)
++                live, nom = LIVE_SCALE
++                ix = np.ix_(list(rs), list(cs))
++                n = float(nom[ix].sum())
++                if n > 0:
++                    self.time = self.time * (float(live[ix].sum()) / n)
+         else:
+             self.is_empty_kernel = np.array([False, False], dtype=np.bool)  # Comp kernels should be empty kernel
+             self.time = np.array([1e-3, 1e-2])  # dummy duration times
+@@ -83,8 +98,11 @@ class Comm_Kernel(Cuda_Kernel):
+         self.hierarchy = hierarchy
+         # kernel time
+         if not seqlen_variable_graph:
++            cmap = m_config.comm_profile_maps[hierarchy]
++            if _FAITHFUL and hierarchy == 1 and int(key[3]) // _GPN != int(key[4]) // _GPN:
++                cmap = m_config.comm_profile_maps[0]     # crosses nodes: inter-node (GDR, NIC shared) profile
+             self.time = np.array([
+-                m_config.comm_profile_maps[hierarchy].get_comm_time_from_map_key((comm_raw_map_key[0] * unit,))
++                cmap.get_comm_time_from_map_key((comm_raw_map_key[0] * unit,))
+                 for unit in units
+             ])    # [fwd/bwd]
+         else:
+diff --git a/search_algo/dump_plan_structure.py b/search_algo/dump_plan_structure.py
+new file mode 100644
+index 0000000..d4ef1f0
+--- /dev/null
++++ b/search_algo/dump_plan_structure.py
+@@ -0,0 +1,158 @@
++"""Dump a fused Execution_Plan's structure as JSON (the plan interchange format of the Dex release).
++
++It records who owns which block, which tiles
++each GPU computes, which of those tiles got fused into which rectangle, every
++transfer with its source and destination, and each GPU's kernels in the order
++the schedule sets.
++
++Plan construction is CPU work, so this runs without measuring and at any CP --
++including CP=8 on a 4-GPU box.
++
++    torchrun --nproc_per_node 1 search_algo/dump_plan_structure.py \
++        --problem <problem.json> --strategy dcp --cp 8 --out plan.json
++"""
++from __future__ import annotations
++
++import argparse, json, os, sys
++import numpy as np
++import torch
++
++sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--problem", required=True)
++    ap.add_argument("--strategy", default="dcp")
++    ap.add_argument("--cp", type=int, default=8)
++    ap.add_argument("--nodes", type=int, default=1,
++                    help="how many NODES the CP spans. The planner's cost model "
++                         "charges an inter-node byte 12x an intra-node one, so a "
++                         "16-GPU plan searched as 1x16 is a DIFFERENT plan from "
++                         "one searched as 4x4 -- pass the real shape.")
++    ap.add_argument("--block-tokens", type=int, default=1024)
++    ap.add_argument("--heads", type=int, default=8)
++    ap.add_argument("--kv-heads", type=int, default=0, help="GQA K/V heads (0 = MHA); needs UA_FAITHFUL=1")
++    ap.add_argument("--transform-mode", default="greedy")
++    ap.add_argument("--sched-rungs", default="flexflow", choices=["flexflow", "all"])
++    ap.add_argument("--rung", default="w_kernel_tile",
++                    choices=["w_kernel_tile", "w/o_kernel_tile"])
++    ap.add_argument("--assignment", default=None)
++    ap.add_argument("--fob", type=int, default=0, help="1: UltraAttn's BACKWARD dependent graph / execution plan (rows send Q, dO, LSE, D; cols K, V; outputs dQ to rows, dK, dV to cols)")
++    ap.add_argument("--out", default=None)
++    ap.add_argument("--batch", default=None,
++                    help="json list of {problem, assignment, out, block_tokens, heads, kv_heads, "
++                         "fusion_budget_s}: one process (distribution + profile DB set up once) builds every plan; "
++                         "per-task seconds -> <batch>.times.jsonl")
++    args = ap.parse_args()
++
++    import dcp_in_ultraattn as D
++    from search_algo.dcp_adapter import plan_from_problem
++
++    import time as _time
++    t_init = _time.perf_counter()
++    ncclcomm_global, gloo_group = D.initialize_distribution()
++    prof_db = D.initialize_prof_db(gloo_group)
++    D.install_profile_interpolation()
++    t_init = _time.perf_counter() - t_init
++    if args.batch is None:
++        assert args.out, "--out (or --batch)"
++        return run_one(args, D, plan_from_problem, prof_db)
++    tasks = json.load(open(args.batch))
++    with open(args.batch + ".times.jsonl", "w") as tf:
++        tf.write(json.dumps(dict(init_s=round(t_init, 3), n=len(tasks))) + "\n")
++        for t in tasks:
++            a = argparse.Namespace(**vars(args))
++            a.problem, a.assignment, a.out = t["problem"], t["assignment"], t["out"]
++            a.block_tokens, a.heads, a.kv_heads = t["block_tokens"], t["heads"], t.get("kv_heads", 0)
++            os.environ["UA_FUSION_BUDGET_S"] = str(t["fusion_budget_s"])
++            t0 = _time.perf_counter(); ok = True
++            try:
++                run_one(a, D, plan_from_problem, prof_db)
++            except Exception as e:   # noqa: BLE001  (one failed problem must not stop the batch)
++                ok = False; print(f"[batch] {t['out']}: {type(e).__name__}: {e}", flush=True)
++            tf.write(json.dumps(dict(out=t["out"], seconds=round(_time.perf_counter() - t0, 3), ok=ok)) + "\n"); tf.flush()
++
++
++def run_one(args, D, plan_from_problem, prof_db):
++    if args.cp % args.nodes:
++        raise SystemExit(f"--cp {args.cp} is not divisible by --nodes {args.nodes}")
++    cp_intra, cp_inter = args.cp // args.nodes, args.nodes
++    print(f"[topo] CP={args.cp} as {cp_inter} node(s) x {cp_intra} GPU(s)", flush=True)
++    prob, asg, bsa_config, table, S_map = plan_from_problem(
++        args.problem, args.strategy, cp_intra, cp_inter,
++        assignment_file=args.assignment)
++    da_config, schedule, plans, failed = D.build_plans(
++        prob, bsa_config, table, S_map, prof_db, args)
++    if torch.distributed.get_rank() != 0:
++        return
++    wanted = [k for k in plans if k[1] == args.rung]
++    if not wanted:
++        # If UltraAttn's fused-plan builder lacks profile-DB entries for this
++        # topology, no fused plan exists for the rung. The assignment is the
++        # only thing a non-UltraAttn executor consumes, so it is still dumped,
++        # with the missing fusion stage recorded (assignment_only,
++        # fusion_error).
++        print(f"rung {args.rung} unavailable: {failed}", flush=True)
++        N = prob.n_blocks
++        tbl = np.asarray(table)
++        while tbl.ndim > 2:
++            tbl = tbl[0]
++        json.dump(dict(
++            family=os.path.basename(args.problem).split("_s0")[0],
++            strategy=args.strategy, cp=args.cp, n_blocks=N,
++            nodes=args.nodes, gpus_per_node=cp_intra,
++            block_tokens=args.block_tokens, rung=args.rung,
++            assignment_only=True, fusion_error=str(failed),
++            end_time=None,
++            owner=[int(S_map[0, b]) for b in range(N)],
++            schedule_table=[[int(tbl[r, c]) for c in range(N)] for r in range(N)],
++            live=[], gpu_kernels=[]), open(args.out, "w"))
++        print(f"-> {args.out}  CP={args.cp} N={N} ASSIGNMENT-ONLY "
++              f"(no fused plan)", flush=True)
++        return
++    plan = plans[wanted[0]]
++
++    N = prob.n_blocks
++    w = prob.weights()
++    st = np.asarray(schedule.schedule_table)[0, 0]     # (Sq, Skv) -> gpu, -1 masked
++
++    gpus = []
++    for g in range(args.cp):
++        kernels = []
++        for k in plan.gpu_kernel_lists[g]:
++            key = k.key
++            rec = dict(start=float(k._start_time), time=float(k.time[0]))
++            if k.type == "comp":
++                r_id, c_id = key[2], key[3]
++                rows = [int(x) for x in r_id] if isinstance(r_id, tuple) else [int(r_id)]
++                cols = [int(x) for x in c_id] if isinstance(c_id, tuple) else [int(c_id)]
++                rec.update(kind="comp", rows=rows, cols=cols,
++                           fused=len(rows) * len(cols) > 1)
++            else:
++                _, _, idx, src, dst, io, rc = key
++                rec.update(kind="comm", block=int(idx), src=int(src), dst=int(dst),
++                           io=io, rc=rc, role="send" if int(src) == g else "recv")
++            kernels.append(rec)
++        gpus.append(kernels)
++
++    out = dict(
++        family=os.path.basename(args.problem).split("_s0")[0],
++        strategy=args.strategy, cp=args.cp, n_blocks=N,
++        nodes=args.nodes, gpus_per_node=cp_intra,
++        block_tokens=args.block_tokens, rung=args.rung, fob=int(getattr(args, "fob", 0)),
++        end_time=float(plan.end_time) if hasattr(plan, "end_time") else None,
++        owner=[int(S_map[0, b]) for b in range(N)],
++        schedule_table=[[int(st[r, c]) for c in range(N)] for r in range(N)],
++        live=[[bool(w[r, c] > 0) for c in range(N)] for r in range(N)],
++        gpu_kernels=gpus,
++    )
++    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
++    json.dump(out, open(args.out, "w"))
++    n_f = sum(1 for gk in gpus for k in gk if k.get("fused"))
++    n_c = sum(1 for gk in gpus for k in gk if k["kind"] == "comp")
++    print(f"-> {args.out}  CP={args.cp} N={N} comp={n_c} fused={n_f}", flush=True)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/search_algo/execute_plan.py b/search_algo/execute_plan.py
+index f6b9bf6..2c9f0a8 100644
+--- a/search_algo/execute_plan.py
++++ b/search_algo/execute_plan.py
+@@ -371,7 +371,7 @@ class Execution_Plan(): # input: kernel streams of gpus
+             elif v.type == 'comm':
+                 stream_kernel_lists[(v.key[3], 1)].append(v)
+                 stream_kernel_lists[(v.key[4], 2)].append(v)
+-        
++
+         # Build&Solve ILP
+         # TOT_TIME_UP ⬆️ -> solver performance ⬆️; corretness ⬇️
+         # TOT_TIME_UP = d_graph.schedule.get_e2e_time()[fob] * 3  # Significant for GUROBI
+@@ -655,7 +655,7 @@ class Execution_Plan(): # input: kernel streams of gpus
+         if not hasattr(self, 'stream_kernel_lists'):
+             # initialize stream_kernel_lists
+             stream_kernel_lists = {}
+-            for g in range(self.hierarchy_sp):
++            for g in range(self.tot_sp):
+                 for s in range(self.stream_num):
+                     stream_kernel_lists[(g, s)] = []
+             # insert valid kernels into stream_kernel_lists
+@@ -702,13 +702,13 @@ class Execution_Plan(): # input: kernel streams of gpus
+         
+         # sort all kernels in each stream according to start_time
+         assert hasattr(self, 'stream_kernel_lists')
+-        for g in range(self.hierarchy_sp):
++        for g in range(self.tot_sp):
+             for s in range(self.stream_num):
+                 self.stream_kernel_lists[(g, s)].sort(key=lambda x: x._start_time)
+             
+         # self.gpu_kernel_lists
+         self.gpu_kernel_lists = []
+-        for g in range(self.hierarchy_sp):
++        for g in range(self.tot_sp):
+             kernel_list = []
+             for s in range(self.stream_num):
+                 kernel_list += self.stream_kernel_lists[(g, s)]
+diff --git a/search_algo/exp_configs.py b/search_algo/exp_configs.py
+index 26c95b5..1ab3781 100644
+--- a/search_algo/exp_configs.py
++++ b/search_algo/exp_configs.py
+@@ -68,41 +68,24 @@ def get_exp_infer_configs():
+ 
+ def get_bsa_train_configs():
+     PLATFORM = os.getenv(f'PLATFORM')
+-    CPs = [
+-        (8, 1),
+-        (8, 2),
+-        (8, 4),
+-        (8, 8),
+-    ]
+-    Ss_total = [
+-        16 * 1024,
+-        32 * 1024,
+-        64 * 1024,
+-        128 * 1024,
+-        256 * 1024,
+-        512 * 1024,
+-        1 * 1024 * 1024,
+-        2 * 1024 * 1024,    # 2M
+-    ]
++    CPs = [tuple(int(x) for x in c.split(',')) for c in
++           os.getenv('UA_CPS', '8,1 8,2 8,4 8,8').split()]
++    Ss_total = [int(x) * 1024 for x in
++                os.getenv('UA_SS_TOTAL_K', '16 32 64 128 256 512 1024 2048').split()]
+     S_per_gpu_LB = 256
+-    S_per_gpu_UB = 64 * 1024   # (8, 8) -> 2M; aims to limit memory usage
+-    GPU_PER_NODE = 8
++    S_per_gpu_UB = int(os.getenv('UA_S_PER_GPU_UB', 64 * 1024))
++    GPU_PER_NODE = int(os.getenv('UA_GPU_PER_NODE', 8))
+     Ss_per_node = [1 << i for i in range(math.ceil(math.log2(Ss_total[0] // CPs[-1][-1])), \
+                                         math.ceil(math.log2(S_per_gpu_UB * GPU_PER_NODE)) + 1)]
+     
+-    Nhs = [
+-        1,
+-        32,
+-    ]
++    Nhs = [int(x) for x in os.getenv('UA_NHS', '1 32').split()]
+     bs = 1
+     D = 128
+     
+     cmap_finest = None
+     global_bsa_reprs = []
+-    # 1. BSA_Repr for stride(1/16, 4, 3) (after remapping)
+-    global_bsa_reprs.append(BSA_Repr(block_table=create_bsa_block_table(0), cmap=cmap_finest))
+-    # 2. BSA_Repr for local+global(1/16, 1, 1) (no remapping)
+-    global_bsa_reprs.append(BSA_Repr(block_table=create_bsa_block_table(1), cmap=cmap_finest))
++    for case_id in (int(x) for x in os.getenv('UA_PATTERNS', '0 1').split()):
++        global_bsa_reprs.append(BSA_Repr(block_table=create_bsa_block_table(case_id), cmap=cmap_finest))
+     # Create inter_node_bsa_configs from global_bsa_reprs   ✅
+     # break global_bsa_reprs down to node-level bsa_repr&bsa_configs !!! ✅
+     inter_node_bsa_configs = []
+@@ -155,38 +138,23 @@ def get_bsa_train_configs():
+ 
+ def get_dense_train_configs():
+     PLATFORM = os.getenv(f'PLATFORM')
+-    CPs = [
+-        (8, 1),
+-        (8, 2),
+-        (8, 4),
+-        (8, 8),
+-    ]
++    CPs = [tuple(int(x) for x in c.split(',')) for c in
++           os.getenv('UA_CPS', '8,1 8,2 8,4 8,8').split()]
+     # CPs = [         # [DEBUG]
+     #     # (8, 1),   
+     #     (8, 2),
+     #     # (8, 4),
+     #     # (8, 8),
+     # ]
+-    Ss_total = [
+-        16 * 1024,
+-        32 * 1024,
+-        64 * 1024,
+-        128 * 1024,
+-        256 * 1024,
+-        512 * 1024,
+-        # 1 * 1024 * 1024,    # 1M, Error for Fused_Execution_Plan
+-        # 2 * 1024 * 1024,    # 2M
+-    ]
++    Ss_total = [int(x) * 1024 for x in
++                os.getenv('UA_SS_TOTAL_K', '16 32 64 128 256 512 1024 2048').split()]
+     S_per_gpu_LB = 256
+-    S_per_gpu_UB = 64 * 1024   # (8, 8) -> 2M; aims to limit memory usage
+-    GPU_PER_NODE = 8
++    S_per_gpu_UB = int(os.getenv('UA_S_PER_GPU_UB', 64 * 1024))
++    GPU_PER_NODE = int(os.getenv('UA_GPU_PER_NODE', 8))
+     Ss_per_node = [1 << i for i in range(math.ceil(math.log2(Ss_total[0] // CPs[-1][-1])), \
+                                         math.ceil(math.log2(S_per_gpu_UB * GPU_PER_NODE)) + 1)]
+     
+-    Nhs = [
+-        1,
+-        32,
+-    ]
++    Nhs = [int(x) for x in os.getenv('UA_NHS', '1 32').split()]
+     bs = 1
+     D = 128
+     
+@@ -249,29 +217,20 @@ def get_dense_train_configs():
+ def get_bsa_infer_configs():
+     # fob must be 0 for inference bases
+     PLATFORM = os.getenv(f'PLATFORM')
+-    CPs = [
+-        (2, 1),
+-        (4, 1),
+-        (8, 1),
+-    ]
+-    Ss_total = [
+-        16 * 1024,
+-        32 * 1024,
+-        64 * 1024,
+-        128 * 1024,
+-        256 * 1024,
+-        512 * 1024,
+-    ]
++    # These grids are hardwired to an 8-GPU node in the original.  Allow the
++    # environment to describe a different node so the same code runs here.
++    CPs = [tuple(int(x) for x in c.split(',')) for c in
++           os.getenv('UA_CPS', '2,1 4,1 8,1').split()]
++    Ss_total = [int(x) * 1024 for x in
++                os.getenv('UA_SS_TOTAL_K', '16 32 64 128 256 512').split()]
+     S_per_gpu_LB = 256
+-    S_per_gpu_UB = 64 * 1024   # (8, 8) -> 2M; aims to limit memory usage
+-    GPU_PER_NODE = 8
++    S_per_gpu_UB = int(os.getenv('UA_S_PER_GPU_UB', 64 * 1024))
++    GPU_PER_NODE = int(os.getenv('UA_GPU_PER_NODE', 8))
+     Ss_per_node = [1 << i for i in range(math.ceil(math.log2(Ss_total[0] // CPs[-1][-1])), \
+                                         math.ceil(math.log2(S_per_gpu_UB * GPU_PER_NODE)) + 1)]
+     
+-    Nhs = [
+-        1,
+-        32,
+-    ]
++    # UA_NHS sets the profiled head counts (default 1 and 32, as upstream).
++    Nhs = [int(x) for x in os.getenv('UA_NHS', '1 32').split()]
+     bs = 1
+     D = 128
+     
+@@ -281,10 +240,11 @@ def get_bsa_infer_configs():
+     # global_bsa_reprs.append(BSA_Repr(block_table=create_bsa_block_table(0), cmap=cmap_finest))
+     # # 1. BSA_Repr for local+global(1/16, 1, 1) (no remapping)
+     # global_bsa_reprs.append(BSA_Repr(block_table=create_bsa_block_table(1), cmap=cmap_finest))
+-    # 2. BSA_Repr for star(1/4) (no remapping)
+-    global_bsa_reprs.append(BSA_Repr(block_table=create_bsa_block_table(2), cmap=cmap_finest))
+-    # 3. BSA_Repr for stream(1/8, 3) (no remapping)
+-    global_bsa_reprs.append(BSA_Repr(block_table=create_bsa_block_table(3), cmap=cmap_finest))
++    # patterns are selectable: 2=star(1/4), 3=stream(1/8,3), 6=shared prefix(Par_D=16),
++    # 7=shared prefix(Par_D=8)
++    for case_id in (int(x) for x in os.getenv('UA_PATTERNS', '2 3').split()):
++        global_bsa_reprs.append(BSA_Repr(block_table=create_bsa_block_table(case_id),
++                                         cmap=cmap_finest))
+     
+     # Create inter_node_bsa_configs from global_bsa_reprs   ✅
+     # break global_bsa_reprs down to node-level bsa_repr&bsa_configs !!! ✅
+diff --git a/search_algo/graph_transformation_engine.py b/search_algo/graph_transformation_engine.py
+index 3bf05d9..ef7b868 100644
+--- a/search_algo/graph_transformation_engine.py
++++ b/search_algo/graph_transformation_engine.py
+@@ -103,11 +103,16 @@ class Comp_Fusion_Substitution(Graph_Substitution):
+         super().__init__()
+         assert len(shape) == 2
+         self.shape = shape
++        self.cap = 0
+     
+     def dfs_lines(self, x_id: int, x_ids: list, y_ids: np.ndarray):
++        if self.cap and len(self.cur_trans) >= self.cap:
++            return
+         if len(x_ids) == self.shape[0]:
+             # Select every group of self.shape[1] y_ids in y_set and add (x_list, y_list) to self.cur_trans
+             for selected_y_ids in itertools.combinations(y_ids, self.shape[1]):
++                if self.cap and len(self.cur_trans) >= self.cap:
++                    return
+                 self.cur_trans.append(Comp_Fusion_Transformation(self, (np.array(x_ids), np.array(selected_y_ids))))
+             return
+         if x_id >= self.bool_schedule_table.shape[0]:
+@@ -147,6 +152,10 @@ class Comp_Fusion_Substitution(Graph_Substitution):
+         for sp_id in range(hierarchy_sp):
+             self.bool_schedule_table = schedule_table_sp == sp_id
+             self.cur_trans = trans[sp_id]
++            rem = getattr(self, "remaining", None)
++            self.cap = rem[sp_id] if rem is not None else 0
++            if rem is not None and self.cap <= 0:
++                continue
+             self.dfs_lines(0, [], np.arange(self.bool_schedule_table.shape[1]))
+         
+         # Retore diagonal values of schedule table
+@@ -165,6 +174,10 @@ class Graph_Transformation_Engine():    # batch engine
+         self.hierarchy = da_config.hierarchy
+         self.tot_sp = da_config.tot_sp
+         self.hierarchy_sp = da_config.SP[self.hierarchy]
++        if os.environ.get("UA_FAITHFUL") == "1":
++            # plans built from an external assignment carry global GPU ids in one flat schedule table (hierarchy 1
++            # over all CP GPUs), so fusion candidates are enumerated over all CP GPU ids
++            self.hierarchy_sp = da_config.tot_sp
+     
+     def print_trans(self):
+         print(f'All transformations:', flush=True)
+@@ -182,7 +195,15 @@ class Graph_Transformation_Engine():    # batch engine
+         self.trans_sp = [] # different comp modules
+         for _ in range(self.hierarchy_sp):
+             self.trans_sp.append([])
++        cap = int(os.environ.get("UA_FUSION_CAND_CAP", "500")) if os.environ.get("UA_FAITHFUL") == "1" else 0
++        if cap:
++            self._rect_candidates(d_graph, cap)
++            return
+         for sub in self.subs_dict['comp_fusion']:
++            if cap:
++                sub.remaining = [cap - len(self.trans_sp[g]) for g in range(self.hierarchy_sp)]
++                if max(sub.remaining) <= 0:
++                    break
+             sub_trans = sub.findall_trans_in_d_graph(d_graph, self.hierarchy_sp)
+             for sp_id in range(self.hierarchy_sp):
+                 self.trans_sp[sp_id] += sub_trans[sp_id]    # (sub0, tran0), (sub0, tran1), (sub1, tran0), (sub1, tran1), ...
+@@ -191,6 +212,44 @@ class Graph_Transformation_Engine():    # batch engine
+             self.trans_all += trans
+         # self.print_trans()
+     
++    def _rect_candidates(self, d_graph, cap):
++        """UA_FAITHFUL candidate set (UA's subset DFS is exponential at 16 GPUs x ~100 blocks): per GPU, every
++        rectangle R x C with C = one row's column set or the intersection of two rows' sets and R = all rows whose
++        set contains C, split into row chunks so that |R|*|C| <= comp_unit_ub (UA's area cap); largest area first,
++        at most `cap` per GPU."""
++        st = np.asarray(d_graph.schedule.schedule_table)[0, 0]
++        ub = self.comp_unit_ub
++        subs = {}
++        self.trans_sp = [[] for _ in range(self.hierarchy_sp)]
++        for g in range(self.hierarchy_sp):
++            rows = {r: frozenset(np.flatnonzero(st[r] == g).tolist()) for r in range(st.shape[0])}
++            rows = {r: c for r, c in rows.items() if c}
++            sets = set(rows.values())
++            rl = list(rows.values())
++            for i in range(len(rl)):
++                for j in range(i + 1, len(rl)):
++                    x = rl[i] & rl[j]
++                    if x:
++                        sets.add(x)
++            rects = set()
++            for C in sets:
++                R = sorted(r for r, c in rows.items() if C <= c)
++                C_ = sorted(C)
++                if len(C_) > ub:
++                    continue
++                step = max(1, ub // len(C_))
++                for k in range(0, len(R), step):
++                    Rk = tuple(R[k:k + step])
++                    if len(Rk) * len(C_) > 1:
++                        rects.add((Rk, tuple(C_)))
++            rects = sorted(rects, key=lambda t: -len(t[0]) * len(t[1]))[:cap]
++            for Rk, C_ in rects:
++                shp = (len(Rk), len(C_))
++                if shp not in subs:
++                    subs[shp] = Comp_Fusion_Substitution(shp)
++                self.trans_sp[g].append(Comp_Fusion_Transformation(subs[shp], (np.array(Rk), np.array(C_))))
++        self.trans_all = [t for ts in self.trans_sp for t in ts]
++
+     def apply_transformations(self, selected_trans: list):
+         new_d_graph = copy.deepcopy(self.d_graph)   # apply transformations on new_d_graph
+         # Print trans
+@@ -262,13 +321,75 @@ class Graph_Transformation_Engine():    # batch engine
+         # for sub in self.subs_dict['comp_fusion']:
+         #     print(f'sub.shape: {sub.shape}', flush=True)
+         
++    def _kernel_gain(self, tran):
++        """Sec. 4.3.2: gain = time of the kernels it replaces - time of the fused kernel (profiled)."""
++        d_graph, fob = self.d_graph, self.exp_config.fob
++        schedule = d_graph.schedule
++        base_t = 0.0
++        for (x, y) in tran.ids_set:
++            g = schedule.schedule_table[0, 0, x, y]
++            base_t += float(d_graph.kernel_dict[(0, 0, x, y, g)].time[fob])
++        key = schedule.m_config.comp_profile_maps[d_graph.hierarchy].get_comp_map_key(
++            schedule.da_config, [len(tran.ids_tuple[0]), len(tran.ids_tuple[1])], schedule.split_degrees)
++        g = schedule.schedule_table[0, 0, tran.ids_tuple[0][0], tran.ids_tuple[1][0]]
++        k = Comp_Kernel((0, 0, tuple(tran.ids_tuple[0]), tuple(tran.ids_tuple[1]), g), schedule.m_config, key,
++                        d_graph.hierarchy)                       # same pricing as the kernel it would create
++        return base_t - float(k.time[fob])
++
++    def ua_greedy(self):
++        """UltraAttn Sec. 4.3.2: sort candidate transformations by gain, apply one at a time, keep it only if the
++        lowering engine's predicted end time improves. Bounded by UA_FUSION_BUDGET_S (default 240 s) of plan
++        evaluations; candidates left when it runs out are skipped (logged)."""
++        import time as _time
++        sys.setrecursionlimit(max(sys.getrecursionlimit(), 100000))   # deepcopy of a large dependency graph
++        budget = float(os.environ.get("UA_FUSION_BUDGET_S", "240"))
++        t_g = _time.perf_counter()
++        cands = []
++        for tran in self.trans_all:
++            gn = self._kernel_gain(tran)
++            if gn > 0:
++                cands.append((gn, tran))
++        cands.sort(key=lambda t: -t[0])
++        print(f'[ua-fusion] gains of {len(self.trans_all)} candidates in {_time.perf_counter() - t_g:.1f}s', flush=True)
++        t_g = _time.perf_counter()
++        best = Execution_Plan(copy.deepcopy(self.d_graph), self.exp_config.fob, plan_type=self.plan_type)
++        best_t, kept, fused_pos, tried, t0 = float(best.end_time), [], set(), 0, _time.perf_counter()
++        print(f'[ua-fusion] {len(self.trans_all)} candidates, {len(cands)} with positive gain; '
++              f'unfused end_time {best_t * 1e3:.2f} ms (one plan evaluation {_time.perf_counter() - t_g:.1f}s)', flush=True)
++        for gn, tran in cands:
++            if fused_pos & tran.ids_set:
++                continue
++            if _time.perf_counter() - t0 > budget:
++                print(f'[ua-fusion] budget {budget:.0f}s exhausted after {tried} evaluations', flush=True)
++                break
++            g2 = copy.deepcopy(self.d_graph)
++            for t_ in kept + [tran]:
++                t_.apply_on_d_graph(g2)
++            plan = Execution_Plan(g2, self.exp_config.fob, plan_type=self.plan_type)
++            tried += 1
++            if float(plan.end_time) < best_t:
++                best, best_t = plan, float(plan.end_time)
++                kept.append(tran); fused_pos |= tran.ids_set
++        print(f'[ua-fusion] kept {len(kept)} of {tried} evaluated; end_time {best_t * 1e3:.2f} ms '
++              f'({_time.perf_counter() - t0:.1f}s)', flush=True)
++        return best
++
+     def transform(self, d_graph: Dependent_Graph, mode: str = 'bf', plan_type: str = 'automatic'):
+         self.d_graph = d_graph
+         self.plan_type = plan_type
++        import time as _time
++        _t = _time.perf_counter()
+         self.calc_subs_dict()
+         self.get_all_transformations()
++        print(f'[fusion] comp_unit_ub {self.comp_unit_ub}, {len(self.comp_fusion_shapes)} shapes, '
++              f'{len(self.trans_all)} candidate transformations ({_time.perf_counter() - _t:.1f}s)', flush=True)
++        if mode == 'none':
++            # No fusion: schedule the base (all-1x1) graph through the same ILP.
++            return self.apply_transformations([])
+         if mode == 'bf':
+             self.dfs_trans(0, [], set())
++        elif mode == 'ua_greedy':
++            return self.ua_greedy()
+         elif mode == 'greedy':
+             # Select transformations greedly
+             fused_pos = set()
+diff --git a/search_algo/initialize.py b/search_algo/initialize.py
+index d7d4563..a46a1f3 100644
+--- a/search_algo/initialize.py
++++ b/search_algo/initialize.py
+@@ -39,6 +39,20 @@ def get_proc_info():
+         nodename = os.environ['SLURMD_NODENAME']
+         tasks_per_node = parse_slurm_tasks_per_node(os.environ['SLURM_TASKS_PER_NODE'])
+         
++    elif os.getenv('TORCHELASTIC_RUN_ID', None) is not None or (
++            os.getenv('RANK') is not None and os.getenv('LOCAL_RANK') is not None):
++        # launched with torchrun
++        rank = int(os.environ['RANK'])
++        local_rank = int(os.environ['LOCAL_RANK'])
++        world_size = int(os.environ['WORLD_SIZE'])
++        tasks_per_node = int(os.environ.get('LOCAL_WORLD_SIZE', world_size))
++        hostname = socket.gethostname()
++        hostip = socket.gethostbyname(hostname)
++        clustername = os.getenv('CLUSTER_NAME', 'Unknown Cluster')
++        nodeid = rank // tasks_per_node
++        nodename = hostname
++        ip = os.environ.get('MASTER_ADDR', hostip)
++
+     elif os.getenv('OMPI_COMM_WORLD_RANK', None) is not None: # launch with OpenMPI
+         rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
+         local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
+@@ -92,6 +106,10 @@ def get_proc_info():
+ def initialize_distribution():
+     PROC_INFO = get_proc_info()
+     set_global_var(f'PROC_INFO', PROC_INFO)
++    # Bind this process to its GPU before any NCCL call, so that every rank's NCCL communicator
++    # is created on its own device (multi-node runs).
++    if torch.cuda.is_available():
++        torch.cuda.set_device(PROC_INFO['local_rank'])
+     # print(f'PROC_INFO: {PROC_INFO}')
+     
+     MASTER_ADDR = os.getenv('MASTER_ADDR', None)
+@@ -107,7 +125,8 @@ def initialize_distribution():
+         world_size=PROC_INFO['world_size'])
+     gloo_global_group_timeout = timedelta(weeks=4)
+     gloo_global_group = dist.new_group(ranks=global_ranks, backend='gloo', timeout=gloo_global_group_timeout)
+-    ncclcomm_global = PyNcclCommunicator(gloo_global_group, ranks=global_ranks, device=PROC_INFO['local_rank'])
++    # CPU-only planning (UA_SIM_PROFILE=1, no visible GPU): no NCCL communicator
++    ncclcomm_global = PyNcclCommunicator(gloo_global_group, ranks=global_ranks, device=PROC_INFO['local_rank']) if torch.cuda.is_available() else None
+     
+     cpu_group_dict = get_global_var_orch('cpu_group_dict')
+     cpu_group_dict[tuple(global_ranks)] = gloo_global_group
+@@ -122,8 +141,12 @@ def initialize_distribution():
+     # for nr in range(math.ceil(math.log2(PROC_INFO['world_size'])) - 1, 2, - 1): # OK
+     for nr in range(math.ceil(math.log2(PROC_INFO['world_size'])) - 1, - 1, - 1): # OK
+         sub_ranks = tuple(range(1 << nr))
++        # dist.new_group is collective: every rank of the parent group calls it, in
++        # the same order, including ranks that are not members (world=16: ranks 8-15
++        # are outside every `range(1 << nr)`). The group is created on all ranks and
++        # the communicator only on members.
++        gloo_global_group_sub = dist.new_group(ranks=sub_ranks, backend='gloo')
+         if torch.distributed.get_rank() in sub_ranks:
+-            gloo_global_group_sub = dist.new_group(ranks=sub_ranks, backend='gloo')
+             ncclcomm_global_sub = PyNcclCommunicator(gloo_global_group_sub, ranks=sub_ranks, device=PROC_INFO['local_rank'])
+             
+             cpu_group_dict = get_global_var_orch('cpu_group_dict')
+diff --git a/search_algo/intra_attn_gen.py b/search_algo/intra_attn_gen.py
+index 5fde2cc..01d79e1 100644
+--- a/search_algo/intra_attn_gen.py
++++ b/search_algo/intra_attn_gen.py
+@@ -36,8 +36,8 @@ def get_configs():
+ def main():
+     CLUSTER_NAME = os.environ.get('CLUSTER_NAME', None)
+     PLATFORM = os.environ.get(f'PLATFORM', None)
+-    assert CLUSTER_NAME in ['qiyuan', 'fit', 'hamming'], f'[ERROR]: Not support CLUSTER_NAME: {CLUSTER_NAME}'
+-    assert PLATFORM in ['A100', 'A800', 'H800', 'H100'], f'[ERROR]: Not support PLATFORM: {PLATFORM}'
++    assert CLUSTER_NAME in ['qiyuan', 'fit', 'hamming', 'local'], f'[ERROR]: Not support CLUSTER_NAME: {CLUSTER_NAME}'
++    assert PLATFORM in ['A100', 'A800', 'H800', 'H100', 'A5000'], f'[ERROR]: Not support PLATFORM: {PLATFORM}'
+     fobs = [
+         0,
+         1,
+diff --git a/search_algo/search_engine.py b/search_algo/search_engine.py
+index 1050f5a..aaa3086 100644
+--- a/search_algo/search_engine.py
++++ b/search_algo/search_engine.py
+@@ -151,8 +151,16 @@ class FlashAttn_Profile_Map(Comp_Profile_Map):
+             
+             S_gcd = math.gcd(S01[0], S01[1])
+             QK_RATIO = f'{S01[0] // S_gcd}/{S01[1] // S_gcd}'
+-            assert S01[0] / S01[1] in [0.25, 0.5, 1, 2, 4], \
+-                f"Current profile data doesn't contain this Q/K Sequence ratio: {S01[0] / S01[1]}"
++            # The guard here is "is this ratio in the profile?", and the profile
++            # holds every reduced p/q with p,q <= 8 -- which is what QK_RATIO on
++            # the line above is built to index.  The original whitelist of
++            # {0.25, 0.5, 1, 2, 4} is narrower than the data and rejects ratios
++            # such as 3/1 or 2/3 that are measured and present; on irregular
++            # block masks a greedy fusion produces those constantly.  (Note the
++            # same check appears commented out at the get_comp_map_key below.)
++            _p, _q = S01[0] // S_gcd, S01[1] // S_gcd
++            assert max(_p, _q) <= 8, \
++                f"Current profile data doesn't contain this Q/K Sequence ratio: {QK_RATIO}"
+             return (min(S01[0], S01[1]), map_key0[1], map_key0[2], map_key0[3], QK_RATIO, map_key0[5])
+             return (min(S01[0], S01[1]), map_key0[1], map_key0[2], map_key0[3], S01[0] / S01[1], map_key0[5])
+         else:
+@@ -300,6 +308,11 @@ class Comm_Profile_Map():
+         if map_key[0] <= 0:
+             return 0
+         
++        if map_key not in self.profile_map.keys() and os.environ.get("UA_FAITHFUL") == "1":
++            ks = sorted(k[0] for k in self.profile_map.keys())
++            x = min(max(map_key[0], ks[0]), ks[-1])
++            bw = float(np.exp(np.interp(np.log(x), np.log(ks), np.log([self.profile_map[(k,)] for k in ks]))))
++            return map_key[0] / pow(BYTE_MULTPLE_DOWN, 3) / bw
+         if map_key not in self.profile_map.keys():
+             max_key = max(key[0] for key in self.profile_map.keys())
+             # print(f'map_key: {map_key[0]}, max_key: {max_key}', flush=True)
+diff --git a/search_algo/task1_bsa.py b/search_algo/task1_bsa.py
+index e601bab..c0c2328 100644
+--- a/search_algo/task1_bsa.py
++++ b/search_algo/task1_bsa.py
+@@ -35,7 +35,7 @@ from search_algo.utils import Block_Type
+ import math
+ 
+ # In-file global vars
+-DTYPE = torch.bfloat16
++DTYPE = torch.float16 if os.environ.get("UA_DTYPE") == "fp16" else torch.bfloat16
+ # End
+ 
+ def get_general_bsa_cc_optimal_schedule_old(exp_config: Evaluation_Configs, da_config: Dist_Attn_Config, prof_db: Prof_DB) -> Dist_Attn_Config:
+@@ -226,6 +226,8 @@ def generate_intra_bsa_execution_plans(exp_config: Evaluation_Configs, da_config
+             bypass_behavior(key)
+         
+         # w Kernel Tile Execution_Plans:
++        if os.environ.get('UA_NO_FUSION') == '1':
++            continue
+         KERNEL_TILE_TYPE = 'w_kernel_tile'
+         print_rank_0(f'{KERNEL_TILE_TYPE}, {KERNEL_SCHEDULE_TYPE}:')
+         key_suffix = f'_ablation=({KERNEL_TILE_TYPE},{KERNEL_SCHEDULE_TYPE})'
+@@ -250,14 +252,20 @@ def profile_all_intra_BSA(args, exp_config: Evaluation_Configs, da_config: Dist_
+     node_num = PROC_INFO['node_num']
+     node_id = PROC_INFO['nodeid']
+     rank = PROC_INFO['rank']
+-    assert local_size == 8, f'[ERROR]: Now not support for local_size({local_size}) intra-node not equal to 8'
++    # The original hardwires an 8-GPU node here, but below local_size is only used
++    # to skip ranks a task does not need (hierarchy_cp <= local_size), which works
++    # for any power-of-two node size.
++    assert local_size in (1, 2, 4, 8, 16), f'[ERROR]: odd local_size({local_size})'
+     
+     # Bypass useless node !!!
+     hierarchy_cp = da_config.hierarchy_sp
+     if hierarchy_cp > local_size:
+         print_rank_0(f'[WARN]: Current task needs {hierarchy_cp} gpus, but now there are only {local_size} gpus !!!')
+         return
+-    if local_rank >= hierarchy_cp:
++    if rank >= hierarchy_cp:
++        # Intra-node profiling only ever involves the first hierarchy_cp ranks.
++        # The original tests local_rank, which is the same thing when the whole
++        # world is one node, but lets ranks on other nodes fall through here.
+         return
+     # Correct gloo_global_group&ncclcomm_global for current task
+     sub_group_key = tuple(range(hierarchy_cp))
+@@ -297,7 +305,7 @@ def profile_all_intra_BSA(args, exp_config: Evaluation_Configs, da_config: Dist_
+     key_suffixes = [f'_ablation=(w/o_gpu_tile,w/o_kernel_tile,Flexflow)']
+     key_suffixes += [f'_ablation=({KERNEL_TILE_TYPE},{KERNEL_SCHEDULE_TYPE})' \
+                         for KERNEL_SCHEDULE_TYPE in ['Flexflow', 'ILP'] \
+-                            for KERNEL_TILE_TYPE in ['w/o_kernel_tile', 'w_kernel_tile']]
++                            for KERNEL_TILE_TYPE in (['w/o_kernel_tile'] if os.environ.get('UA_NO_FUSION') == '1' else ['w/o_kernel_tile', 'w_kernel_tile'])]
+     keys = [f'{key_preffix}{key_suffix}' for key_suffix in key_suffixes]
+     print_rank_0(f'key_preffix: {key_preffix}')
+     # Generate inter_comp_plans_dicts
+@@ -368,14 +376,20 @@ def profile_all_intra_full(args, exp_config: Evaluation_Configs, da_config: Dist
+     node_num = PROC_INFO['node_num']
+     node_id = PROC_INFO['nodeid']
+     rank = PROC_INFO['rank']
+-    assert local_size == 8, f'[ERROR]: Now not support for local_size({local_size}) intra-node not equal to 8'
++    # The original hardwires an 8-GPU node here, but below local_size is only used
++    # to skip ranks a task does not need (hierarchy_cp <= local_size), which works
++    # for any power-of-two node size.
++    assert local_size in (1, 2, 4, 8, 16), f'[ERROR]: odd local_size({local_size})'
+     
+     # Bypass useless node !!!
+     hierarchy_cp = da_config.hierarchy_sp
+     if hierarchy_cp > local_size:
+         print_rank_0(f'[WARN]: Current task needs {hierarchy_cp} gpus, but now there are only {local_size} gpus !!!')
+         return
+-    if local_rank >= hierarchy_cp:
++    if rank >= hierarchy_cp:
++        # Intra-node profiling only ever involves the first hierarchy_cp ranks.
++        # The original tests local_rank, which is the same thing when the whole
++        # world is one node, but lets ranks on other nodes fall through here.
+         return
+     # Correct gloo_global_group&ncclcomm_global for current task
+     sub_group_key = tuple(range(hierarchy_cp))
+@@ -560,7 +574,7 @@ def generate_inter_bsa_execution_plans(exp_config: Evaluation_Configs, da_config
+     #   2. Generate 4=2x2 types of Execution_Plans for ablations:
+     key_preffix = f'fob={exp_config.fob}_CP={da_config.bsa_config.CP}_shape_config={{{da_config.get_shape_config_str()}}}_bsa_config={{{da_config.bsa_config}}}'
+     plan_types = ['Flexflow', 'ILP']
+-    kernel_tile_types = ['w/o_kernel_tile', 'w_kernel_tile']
++    kernel_tile_types = (['w/o_kernel_tile'] if os.environ.get('UA_NO_FUSION') == '1' else ['w/o_kernel_tile', 'w_kernel_tile'])
+     for i, KERNEL_SCHEDULE_TYPE in enumerate(plan_types):
+         for j, KERNEL_TILE_TYPE in enumerate(kernel_tile_types):
+             print_rank_0(f'{KERNEL_TILE_TYPE}, {KERNEL_SCHEDULE_TYPE}:')
+@@ -696,7 +710,35 @@ def step1_generate_intra_full_exe_plans(intra_node_bsa_configs, shape_config_dic
+             generate_general_full_execution_plans(exp_config, da_config, hierarchy, prof_db, is_bypass_mode)
+     return intra_exp_da_configs
+ 
++def sim_profile_intra_BSA(exp_config: Evaluation_Configs, da_config: Dist_Attn_Config, prof_db: Prof_DB):
++    # UA_SIM_PROFILE=1 (with UA_NO_FUSION=1): price each intra plan
++    # by UA's own simulated end_time (the `sim_time` upstream already stores next to the measured time) instead of
++    # running it on the GPUs. Same keys as profile_all_intra_BSA, so step3 / select_best_profile_comp_key are untouched.
++    with open(prof_db.INTRA_BSA_EXE_PLANS_KV, 'r') as f:
++        intra_bsa_exe_plans_dict = json.load(f)
++    with open(prof_db.INTRA_BSA_EXE_PLANS_PROFILE, 'r') as f:
++        intra_bsa_exe_plans_profile = json.load(f)
++    key_preffix = f'fob={exp_config.fob}_CP={da_config.bsa_config.CP}_shape_config={{{da_config.get_shape_config_str()}}}_bsa_config={{{da_config.bsa_config}}}'
++    key_suffixes = [f'_ablation=(w/o_gpu_tile,w/o_kernel_tile,Flexflow)']
++    key_suffixes += [f'_ablation=({KERNEL_TILE_TYPE},{KERNEL_SCHEDULE_TYPE})' \
++                        for KERNEL_SCHEDULE_TYPE in ['Flexflow', 'ILP'] \
++                            for KERNEL_TILE_TYPE in (['w/o_kernel_tile'] if os.environ.get('UA_NO_FUSION') == '1' else ['w/o_kernel_tile', 'w_kernel_tile'])]
++    for key in [f'{key_preffix}{key_suffix}' for key_suffix in key_suffixes]:
++        if key in intra_bsa_exe_plans_profile.keys():   # Bypassed
++            continue
++        with open(f'{prof_db.INTRA_BSA_EXE_PLANS_DIR}/{intra_bsa_exe_plans_dict[key]}.pkl', 'rb') as fin:
++            sim_time = pickle.load(fin).end_time
++        intra_bsa_exe_plans_profile[key] = {'hfu': None, 'time': f'{sim_time:.3e}', 'sim_time': f'{sim_time:.3e}', 'source': 'sim'}
++    with open(prof_db.INTRA_BSA_EXE_PLANS_PROFILE, 'w') as f:
++        json.dump(intra_bsa_exe_plans_profile, f)
++
+ def step2_profile_intra_bsa_exe_plans(intra_exp_da_configs, ncclcomm_global, gloo_global_group, prof_db):
++    if os.environ.get('UA_SIM_PROFILE') == '1':
++        if torch.distributed.get_rank() == 0:
++            for exp_da_config in intra_exp_da_configs:
++                sim_profile_intra_BSA(exp_da_config['exp_config'], exp_da_config['da_config'], prof_db)
++        torch.distributed.barrier(gloo_global_group)
++        return
+     MAX_S_perG, MAX_NH, MAX_D, MAX_bs = 0, 0, 0, 0
+     for exp_da_config in intra_exp_da_configs:
+         da_config = exp_da_config['da_config']
+@@ -929,10 +971,18 @@ def main(args):
+         if torch.distributed.get_rank() == 0:
+             step3_generate_inter_dense_exe_plans(inter_node_bsa_configs, shape_config_dict, exp_configs, prof_db) # Full + Causal
+     else:
++        import time as _t; _T = [_t.time()]
++        if torch.distributed.get_rank() == 0:
++            print('[ua-time] start', flush=True)      # planning time is measured from here
++        def _lap(name):
++            _T.append(_t.time())
++            if torch.distributed.get_rank() == 0:
++                print(f"[ua-time] {name}: {_T[-1] - _T[-2]:.2f} s (total {_T[-1] - _T[0]:.2f} s)", flush=True)
+         # Step1: Generate execution plans for all BSA at intra_SP=2,4,8; need all cpus on one node; (w cache/bypass)
+         if torch.distributed.get_rank() == 0: #and not torch.cuda.is_available():
+             step1_generate_intra_bsa_exe_plans(intra_node_bsa_configs, shape_config_dict, exp_configs, prof_db)
+         torch.distributed.barrier(gloo_global_group)
++        _lap("step1 intra plans")
+         # return    # Step1 End
+ 
+         intra_exp_da_configs = step1_generate_intra_bsa_exe_plans(intra_node_bsa_configs, shape_config_dict, exp_configs, prof_db, is_bypass_mode=True)  # Bypass mode
+@@ -940,13 +990,17 @@ def main(args):
+         # return      # Step1 End
+ 
+         # Step2: Profile all BSA at intra_SP=8; one node, one processor occupies one gpu and even cpus; (w cache/bypass)
+-        if torch.cuda.is_available():
++        _lap("step1 bypass reload")
++        if torch.cuda.is_available() or os.environ.get('UA_SIM_PROFILE') == '1':
+             step2_profile_intra_bsa_exe_plans(intra_exp_da_configs, ncclcomm_global, gloo_global_group, prof_db)
++        torch.distributed.barrier(gloo_global_group)
++        _lap("step2 sim profile of intra plans" if os.environ.get("UA_SIM_PROFILE") == "1" else "step2 GPU profiling of intra plans")
+         # return  # Step2 End
+         
+         # Step3: Generate execution plans for all BSA at inter_SP=2,4,8; need all cpus on one node; (w cache/bypass)
+         if torch.distributed.get_rank() == 0:
+             step3_generate_inter_bsa_exe_plans(inter_node_bsa_configs, shape_config_dict, exp_configs, prof_db)
++            _lap("step3 inter plans")
+     
+ if __name__ == '__main__':
+     main(parse_args())
+\ No newline at end of file
+diff --git a/search_algo/task2_bsa.py b/search_algo/task2_bsa.py
+index 96bb19e..b930896 100644
+--- a/search_algo/task2_bsa.py
++++ b/search_algo/task2_bsa.py
+@@ -32,7 +32,7 @@ from orchestrated_attn.global_vars import get_global_var as get_global_var_orch
+ from search_algo.dense_utils import create_ablation_configs_for_full
+     
+ # In-file global vars
+-DTYPE = torch.bfloat16
++DTYPE = torch.float16 if os.environ.get("UA_DTYPE") == "fp16" else torch.bfloat16
+ # End
+ 
+ def profile_all_inter_BSA(args, exp_config: Evaluation_Configs, da_config: Dist_Attn_Config, ncclcomm_global, gloo_global_group, \
+@@ -51,7 +51,10 @@ def profile_all_inter_BSA(args, exp_config: Evaluation_Configs, da_config: Dist_
+     node_id = PROC_INFO['nodeid']
+     node_num = PROC_INFO['node_num']
+     rank = PROC_INFO['rank']
+-    assert local_size == 8, f'[ERROR]: Now not support for local_size({local_size}) intra-node not equal to 8'
++    # The original hardwires an 8-GPU node here, but below local_size is only used
++    # to skip ranks a task does not need (hierarchy_cp <= local_size), which works
++    # for any power-of-two node size.
++    assert local_size in (1, 2, 4, 8, 16), f'[ERROR]: odd local_size({local_size})'
+ 
+     # Bypass useless node !!!
+     hierarchy_cp = da_config.hierarchy_sp
+@@ -86,6 +89,8 @@ def profile_all_inter_BSA(args, exp_config: Evaluation_Configs, da_config: Dist_
+     WARMUP, NUM_ITER = 2, 4 # intermediate, best performance for some cases !!!
+     # WARMUP, NUM_ITER = 1, 2 # later, bad performance
+     # WARMUP, NUM_ITER = 0, 1 # [DEBUG]
++    # timing rule: 3 warm-up + 10 timed calls (UA_WARMUP / UA_NUM_ITER), without editing the defaults above
++    WARMUP = int(os.getenv('UA_WARMUP', WARMUP)); NUM_ITER = int(os.getenv('UA_NUM_ITER', NUM_ITER))
+     
+     # Prepare database
+     with open(prof_db.INTER_BSA_EXE_PLANS_KV, 'r') as f:
+@@ -96,7 +101,7 @@ def profile_all_inter_BSA(args, exp_config: Evaluation_Configs, da_config: Dist_
+     key_suffixes = [f'_ablation=(w/o_gpu_tile,w/o_kernel_tile,Flexflow)']
+     key_suffixes += [f'_ablation=({KERNEL_TILE_TYPE},{KERNEL_SCHEDULE_TYPE})' \
+                         for KERNEL_SCHEDULE_TYPE in ['Flexflow', 'ILP'] \
+-                            for KERNEL_TILE_TYPE in ['w/o_kernel_tile', 'w_kernel_tile']]
++                            for KERNEL_TILE_TYPE in (['w/o_kernel_tile'] if os.environ.get('UA_NO_FUSION') == '1' else ['w/o_kernel_tile', 'w_kernel_tile'])]
+     keys = [f'{key_preffix}{key_suffix}' for key_suffix in key_suffixes]
+     # Generate inter_comp_plans_dicts
+     inter_bsa_execution_plans = []  # inter_bsa_execution_plans and inter_comp_plans_dicts are bijective !!!
+@@ -163,7 +168,10 @@ def profile_all_inter_full(args, exp_config: Evaluation_Configs, da_config: Dist
+     node_id = PROC_INFO['nodeid']
+     node_num = PROC_INFO['node_num']
+     rank = PROC_INFO['rank']
+-    assert local_size == 8, f'[ERROR]: Now not support for local_size({local_size}) intra-node not equal to 8'
++    # The original hardwires an 8-GPU node here, but below local_size is only used
++    # to skip ranks a task does not need (hierarchy_cp <= local_size), which works
++    # for any power-of-two node size.
++    assert local_size in (1, 2, 4, 8, 16), f'[ERROR]: odd local_size({local_size})'
+ 
+     # Bypass useless node !!!
+     hierarchy_cp = da_config.hierarchy_sp
+diff --git a/search_algo/workload_partition.py b/search_algo/workload_partition.py
+index ea33571..f0b6e47 100644
+--- a/search_algo/workload_partition.py
++++ b/search_algo/workload_partition.py
+@@ -57,7 +57,13 @@ def print_lp_result(CP: int, ParD: int, Vars: dict, v_attr: str, cmap: Union[Non
+             max_v = 0
+             max_kid = -1
+             for k in range(CP):
+-                cur_v = getattr(Vars[f'x_{i}_{j}_{k}'], v_attr)
++                var = Vars[f'x_{i}_{j}_{k}']
++                # gurobipy 12 made attribute names case sensitive: the solution
++                # value is `X` on a gurobi Var, `varValue` on a pulp one.
++                try:
++                    cur_v = getattr(var, v_attr)
++                except AttributeError:
++                    cur_v = getattr(var, v_attr.upper())
+                 if cur_v > max_v:
+                     max_v = cur_v
+                     max_kid = k
+@@ -76,7 +82,13 @@ def convert_result_to_np(CP: int, ParD: int, Vars: dict, v_attr: str, cmap: Unio
+             max_v = 0
+             max_kid = -1
+             for k in range(CP):
+-                cur_v = getattr(Vars[f'x_{i}_{j}_{k}'], v_attr)
++                var = Vars[f'x_{i}_{j}_{k}']
++                # gurobipy 12 made attribute names case sensitive: the solution
++                # value is `X` on a gurobi Var, `varValue` on a pulp one.
++                try:
++                    cur_v = getattr(var, v_attr)
++                except AttributeError:
++                    cur_v = getattr(var, v_attr.upper())
+                 if cur_v > max_v:
+                     max_v = cur_v
+                     max_kid = k
+@@ -248,6 +260,7 @@ def Quad_LP_GUROBI(N: int):
+         mylp.addConstr(Vars[f'Cout_{g}'] <= Vars[f'Comm_Volume'])
+     
+     # # 4. Load Balance
++    balance_constrs = []
+     if LOAD_BALANCE:
+         COMP_UB = int(math.ceil((1 + N - 1) * (N - 1) / 2 / N))
+         for g in range(N):
+@@ -257,9 +270,21 @@ def Quad_LP_GUROBI(N: int):
+     # Objective
+     mylp.setObjective(Vars[f'Comm_Volume'], GRB.MINIMIZE)
+     
+-    # Solve
++    # Solve.  COMP_UB above is ceil(COMP_TOTAL / CP_) plus a few bumps hardwired
++    # for UltraAttn's own configurations.
++    # Any other pattern/CP combination makes the balance constraint infeasible, so
++    # relax it until a schedule exists and report how much slack was needed.
+     t0 = time.time()
+     mylp.optimize()
++    slack = 0.0
++    while mylp.status != gp.GRB.OPTIMAL and balance_constrs and slack < 4.0:
++        slack += 0.5
++        for c, base in balance_constrs:
++            c.RHS = base + slack
++        mylp.reset()
++        mylp.optimize()
++    if slack:
++        print(f'[balance] relaxed COMP_UB by +{slack} to become feasible', flush=True)
+     t1 = time.time()
+     print(f'LP solve time: {t1 - t0} s', flush=True)
+     
+@@ -416,6 +441,7 @@ def Quad_LP_GUROBI_from_block_config(block_config: Union[Block_Attention_Config,
+         mylp.addConstr(Vars[f'Cout_{g}'] <= Vars[f'Comm_Volume'])
+     
+     # # 4. Load Balance
++    balance_constrs = []
+     if LOAD_BALANCE:
+         # if block_config.CP[1] == 1: # Intra schedule
+         if hierarchy == 1: # Intra schedule
+@@ -446,22 +472,38 @@ def Quad_LP_GUROBI_from_block_config(block_config: Union[Block_Attention_Config,
+             ]) if diagonal_full else 0
+             # print_rank_0(f'diagonal_COMP_g of {g}: {diagonal_COMP_g}')
+             
+-            mylp.addConstr(gp.quicksum([Vars[f'x_{i}_{j}_{g}'] * calc_table_comp_relative_time(
++            balance_constrs.append((mylp.addConstr(gp.quicksum([Vars[f'x_{i}_{j}_{g}'] * calc_table_comp_relative_time(
+                 cur_block_table[i*sub_shape[0]:(i+1)*sub_shape[0], j*sub_shape[1]:(j+1)*sub_shape[1]]
+-            ) for i, j in block_ids]) <= COMP_UB - diagonal_COMP_g)
++            ) for i, j in block_ids]) <= COMP_UB - diagonal_COMP_g), COMP_UB - diagonal_COMP_g))
+ 
+     # Objective
+     mylp.setObjective(Vars[f'Comm_Volume'], GRB.MINIMIZE)
+     
+-    # Solve
++    # Solve.  COMP_UB above is ceil(COMP_TOTAL / CP_) plus a few bumps hardwired
++    # for UltraAttn's own configurations.
++    # Any other pattern/CP combination makes the balance constraint infeasible, so
++    # relax it until a schedule exists and report how much slack was needed.
+     t0 = time.time()
+     mylp.optimize()
++    slack = 0.0
++    while mylp.status != gp.GRB.OPTIMAL and balance_constrs and slack < 4.0:
++        slack += 0.5
++        for c, base in balance_constrs:
++            c.RHS = base + slack
++        mylp.reset()
++        mylp.optimize()
++    if slack:
++        print(f'[balance] relaxed COMP_UB by +{slack} to become feasible', flush=True)
+     t1 = time.time()
+     print(f'LP solve time: {t1 - t0} s', flush=True)
+     # print(f'Model status: {mylp.status}', flush=True)
+     # # print_lp_result
+     if mylp.status == gp.GRB.OPTIMAL:
+         print(f"Optimal value: {mylp.objVal}")
++    else:
++        raise RuntimeError(f'[ILP] gurobi status={mylp.status} '
++                           f'(2=OPTIMAL, 3=INFEASIBLE, 4=INF_OR_UNBD, 5=UNBOUNDED, '
++                           f'9=TIME_LIMIT); vars={mylp.NumVars} constrs={mylp.NumConstrs}')
+     # print_lp_result(CP_, ParD, Vars, 'x', cmap=cmap, diagonal_full=diagonal_full)
+     return {
+         'Par_D': ParD,
+diff --git a/tests/distributed/device_communicators/pynccl.py b/tests/distributed/device_communicators/pynccl.py
+index f7aa047..77c5870 100644
+--- a/tests/distributed/device_communicators/pynccl.py
++++ b/tests/distributed/device_communicators/pynccl.py
+@@ -271,8 +271,12 @@ class PyNcclCommunicator:
+             f"but the input tensor is on {tensor.device}")
+         if stream is None:
+             stream = self.stream
++        # int(): callers pass `self.rank < global_dst`, which is a numpy.bool_
++        # when the peer id comes out of a numpy schedule table. ctypes accepts a
++        # Python bool for c_int but REJECTS numpy.bool_ with
++        # an ArgumentError on argument 4.
+         self.nccl.ncclSend(buffer_type(tensor.data_ptr()), tensor.numel(),
+-                           ncclDataTypeEnum.from_torch(tensor.dtype), dst,
++                           ncclDataTypeEnum.from_torch(tensor.dtype), int(dst),
+                            self.comm, cudaStream_t(stream.cuda_stream))
+ 
+     def recv(self, tensor: torch.Tensor, src: int, stream=None):
+@@ -284,7 +288,7 @@ class PyNcclCommunicator:
+         if stream is None:
+             stream = self.stream
+         self.nccl.ncclRecv(buffer_type(tensor.data_ptr()), tensor.numel(),
+-                           ncclDataTypeEnum.from_torch(tensor.dtype), src,
++                           ncclDataTypeEnum.from_torch(tensor.dtype), int(src),
+                            self.comm, cudaStream_t(stream.cuda_stream))
+ 
+     def group_start(self):
+diff --git a/tests/distributed/device_communicators/pynccl_wrapper.py b/tests/distributed/device_communicators/pynccl_wrapper.py
+index 5a16a4b..17ee24c 100644
+--- a/tests/distributed/device_communicators/pynccl_wrapper.py
++++ b/tests/distributed/device_communicators/pynccl_wrapper.py
+@@ -210,4 +210,19 @@ class NCCLLibrary:
+         so_file = f'{os.path.dirname(__file__)}/../../../third_party/comm_test/third_party/nccl/build/lib/libnccl.so.2' # General, v2.21.5-1
++        # The path above is the `comm_test` submodule, which this setup does not
++        # fetch. An explicit UA_NCCL_SO_PATH takes precedence; otherwise the
++        # submodule's library if present, else the NCCL bundled with PyTorch
++        # (2.21.5 for torch 2.5.1, the version the comments above name).
++        _env = os.environ.get('UA_NCCL_SO_PATH')
++        if _env and os.path.exists(_env):
++            so_file = _env
++        elif not os.path.exists(so_file):
++            try:
++                import nvidia.nccl as _nv
++                _cand = os.path.join(os.path.dirname(_nv.__file__), 'lib', 'libnccl.so.2')
++                if os.path.exists(_cand):
++                    so_file = _cand
++            except Exception:
++                pass
+         so_file = so_file or find_nccl_library()
+         # print(f'so_file: {so_file}')
+         try:
+diff --git a/tools/profile_kernel.py b/tools/profile_kernel.py
+new file mode 100644
+index 0000000..584a589
+--- /dev/null
++++ b/tools/profile_kernel.py
+@@ -0,0 +1,115 @@
++"""Stand-in for UltraAttn's `third_party/kernel_profiler` submodule, which is not public.
++
++Emits the same JSON the cost model reads:
++
++    {"flash_attn": [ [[min(Sq,Skv), bs, Nh, D, "Sq/Skv", causal], [fwd_us, bwd_us]], ... ]}
++
++The key layout is `Machine_Config.get_comp_map_key` (search_algo/search_engine.py:196)
++and the values are consumed by `convert_profile_data_to_map`, which divides by 1e6.
++
++    python tools/profile_kernel.py --out database/m_configs/time_<cluster>_m2.json
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import time
++
++import torch
++from flash_attn import flash_attn_func
++
++from math import gcd
++
++# The tiler can ask for any Q/KV length ratio a/b with max(a, b) <= 8 (the limit
++# asserted in search_engine.get_comp_map_key).  Their shipped profile data only
++# covers seven of them, which is why irregular patterns hit "key not found".
++ALL_RATIOS = [f"{a}/{b}" for a in range(1, 9) for b in range(1, 9) if gcd(a, b) == 1]
++DEFAULT_RATIOS = ["1/1", "1/2", "2/1", "1/3", "3/1", "1/4", "4/1"]
++
++
++def bench(fn, iters, warmup=10):
++    for _ in range(warmup):
++        fn()
++    torch.cuda.synchronize()
++    t0 = time.perf_counter()
++    for _ in range(iters):
++        fn()
++    torch.cuda.synchronize()
++    return (time.perf_counter() - t0) / iters * 1e6            # microseconds
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--seqs", type=int, nargs="*",
++                    default=[256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536])
++    ap.add_argument("--bs", type=int, nargs="*", default=[1])
++    # NOTE: the default head counts skip nheads=1, the setting UltraAttn's own
++    # experiments use to emulate pairing with Ulysses: with batch 1 and one head
++    # flash-attn's forward timing does not follow the head scaling of nheads
++    # 2..32. Pass --nh 1 to profile it anyway.
++    ap.add_argument("--nh", type=int, nargs="*", default=[2, 4, 8, 32])
++    ap.add_argument("--dim", type=int, default=128)
++    ap.add_argument("--max-elems", type=float, default=5e10,
++                    help="skip a shape when bs*Sq*Skv*Nh exceeds this (time/memory guard)")
++    ap.add_argument("--dtype", default="bf16")
++    ap.add_argument("--nkv", type=int, default=0,
++                    help="GQA: K/V heads (0 = MHA, K/V have --nh heads). The profile key keeps Nh = query heads, so a "
++                         "per-model database (one GQA ratio) is consumed unchanged by the cost model.")
++    ap.add_argument("--warmup", type=int, default=10)
++    ap.add_argument("--ratios", default="default", choices=["default", "all"])
++    ap.add_argument("--merge", default=None,
++                    help="existing json to extend rather than replace")
++    args = ap.parse_args()
++
++    dt = dict(bf16=torch.bfloat16, fp16=torch.float16)[args.dtype]
++    ratios = ALL_RATIOS if args.ratios == 'all' else DEFAULT_RATIOS
++    out, t_start = [], time.perf_counter()
++    have = set()
++    if args.merge:
++        out = json.load(open(args.merge))['flash_attn']
++        have = {tuple(e[0]) for e in out}
++        print(f'merging into {len(out)} existing shapes', flush=True)
++    for S in args.seqs:
++        for bs in args.bs:
++            for nh in args.nh:
++                for ratio in ratios:
++                    a, b = (int(x) for x in ratio.split("/"))
++                    sq, skv = S * a, S * b
++                    if bs * sq * skv * nh > args.max_elems:
++                        continue
++                    for causal in (False, True):
++                        if (S, bs, nh, args.dim, ratio, causal) in have:
++                            continue
++                        if causal and sq != skv:
++                            continue          # causal is only profiled on square shapes
++                        try:
++                            q = torch.randn(bs, sq, nh, args.dim, device="cuda",
++                                            dtype=dt, requires_grad=True)
++                            k = torch.randn(bs, skv, args.nkv or nh, args.dim, device="cuda",
++                                            dtype=dt, requires_grad=True)
++                            v = torch.randn_like(k, requires_grad=True)
++                            work = bs * sq * skv * nh
++                            it = int(max(3, min(20, 2e10 / max(work, 1))))
++                            fwd = bench(lambda: flash_attn_func(q, k, v, causal=causal), it, args.warmup)
++                            o = flash_attn_func(q, k, v, causal=causal)
++                            g = torch.randn_like(o)
++                            bwd = bench(lambda: torch.autograd.grad(
++                                o, (q, k, v), g, retain_graph=True), it, args.warmup)
++                            out.append([[S, bs, nh, args.dim, ratio, causal],
++                                        [round(fwd, 3), round(bwd, 3)]])
++                            print(f"S={S:7d} bs={bs:3d} Nh={nh} {ratio:4s} causal={causal:d}"
++                                  f"  fwd {fwd:9.1f}us  bwd {bwd:9.1f}us", flush=True)
++                        except torch.OutOfMemoryError:
++                            print(f"S={S} bs={bs} {ratio} causal={causal}: OOM, skipped",
++                                  flush=True)
++                        finally:
++                            del q, k, v
++                            torch.cuda.empty_cache()
++    json.dump({"flash_attn": out}, open(args.out, "w"))
++    print(f"\n{len(out)} shapes in {time.perf_counter() - t_start:.0f}s -> {args.out}")
++
++
++if __name__ == "__main__":
++    main()

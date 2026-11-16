@@ -1,0 +1,24 @@
+# W4 and W6 (operator tests, end-to-end, W4 selection and inputs), and vLLM for the W2 / W3 rollouts.
+# Python 3.12.13; torch built for CUDA 12.9. The Dex extension was compiled with nvcc 12.9.86 (conda-forge cuda-nvcc) and
+# InfLLM-v2's extension (infllm_v2.C) with nvcc 12.6.85. DEX_CUDA_HOME needs bin/ and include/ of the toolkit.
+# This environment gets its own extension builds:
+#   DEX_PYTHON=<python> DEX_CUDA_HOME=<12.9> bash build/build_ext.sh --infllm-dtype bf16 --infllm-cuda-home <12.6>   W4, default output build/ext_bf16
+#   DEX_PYTHON=<python> DEX_CUDA_HOME=<12.9> bash build/build_ext.sh --out <DIR>                                     W6, run with DEX_EXT_DIR=<DIR>
+# Not on PyPI: third_party/flex_prefill, installed with `pip install --no-deps -e third_party/flex_prefill` (its pins belong to
+# requirements/w6_official.txt; selection only needs the Python code). NVSHMEM 3.7.1 (DEX_NVSHMEM_HOME).
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch==2.13.0+cu129
+numpy==2.3.5
+einops==0.8.2
+safetensors==0.8.0
+transformers==5.15.1
+tokenizers==0.22.2
+sentencepiece==0.2.2
+triton==3.7.1
+psutil==7.2.2
+packaging==26.3
+ninja==1.13.0
+setuptools==80.10.2
+# W2 / W3 rollouts only
+pyarrow==25.0.1
+vllm @ git+https://github.com/vllm-project/vllm.git@bc39ded3c4e7b0453af76c617883e5cd88092222
