@@ -2,7 +2,7 @@
 
 Dex runs distributed sparse attention with masks that can change on every call. It combines GPU-accelerated assignment, CPU scheduling and a persistent GPU executor to reuse data, balance work and overlap communication with attention computation.
 
-This repository implements **DexAttention: Distributed Sparse Attention through Rapid Online Planning and Persistent GPU Execution** and includes forward/backward kernels, six evaluation workloads, baseline adapters and reproduction scripts.
+This repository implements **[DexAttention: Distributed Sparse Attention through Rapid Online Planning and Persistent GPU Execution](https://arxiv.org/abs/2611.23512)** ([PDF](https://arxiv.org/pdf/2611.23512)) and includes forward/backward kernels, six evaluation workloads, baseline adapters and reproduction scripts.
 
 ## How it works
 
