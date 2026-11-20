@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use DexAttention in your research, please cite the paper below."
+title: "DexAttention"
+authors:
+  - family-names: Chen
+    given-names: Sirui
+  - family-names: Qian
+    given-names: Xuehai
+repository-code: "https://github.com/CsRic/DexAttention"
+preferred-citation:
+  type: article
+  title: "DexAttention: Distributed Sparse Attention through Rapid Online Planning and Persistent GPU Execution"
+  authors:
+    - family-names: Chen
+      given-names: Sirui
+    - family-names: Qian
+      given-names: Xuehai
+  journal: "arXiv preprint arXiv:2611.23512"
+  year: 2026
+  doi: "10.48550/arXiv.2611.23512"
+  url: "https://arxiv.org/abs/2611.23512"
